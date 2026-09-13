@@ -43,8 +43,10 @@ just another kind of entry in it:
 pub struct TransitionId(u64); // monotonic, assigned when an entry is appended
 
 pub trait Transition<S, E> {
-    /// Pure: must return the same output for the same `state`, every time.
-    fn apply(&self, state: &S) -> Result<S, E>;
+    /// Must produce the same mutation for the same input state, every time.
+    /// May mutate `state` partway before returning `Err` — `StateMachine`
+    /// does not rely on failed transitions leaving `state` untouched.
+    fn apply(&self, state: &mut S) -> Result<(), E>;
 }
 
 enum LogEntry<S, E> {
@@ -54,10 +56,60 @@ enum LogEntry<S, E> {
 
 pub struct StateMachine<S, E> {
     log: Vec<(TransitionId, LogEntry<S, E>)>,
-    initial: S,
-    current: S,
+    current: S, // private field; only `apply`/`undo` (below) ever get `&mut`
 }
 ```
+
+There is deliberately no `initial: S` field. The whole point of keeping an
+append-only log is that it is the full record of how `current` came to be
+— an `initial` snapshot supplied at construction time would be exactly
+the kind of fact about `current` that the log *doesn't* explain, which
+undermines the same audit property the log's append-only-ness exists to
+give (see the rejected "physically excising" alternative below). So every
+replay — on `undo`, and on `apply`'s error path — starts from `S::default()`
+rather than a stored/cloned `initial`. This also drops the `S: Clone` bound
+from the whole crate in favor of `S: Default`: nothing is ever cloned,
+only (re)computed from nothing and mutated forward.
+
+`apply` mutates `state` in place rather than returning a new `S`. Some
+consumers' states are large with only a small part changing per
+transition, so rebuilding the whole value on every step would be wasteful.
+`current` is a private field, so ordinary Rust visibility already gives
+the guarantee needed here: only code inside this crate can ever obtain
+`&mut self.current`, and `StateMachine` only does so from its own
+apply/replay logic (below). Outside the crate, the sole way to observe
+`current` is the `pub fn current(&self) -> &S` accessor, and a
+`Transition` impl never sees `current` itself — only the single `&mut S`
+it's handed for the duration of its own `apply` call. No wrapper type is
+needed to enforce this; it falls out of `current` simply not being `pub`.
+
+**Optimistic apply, heal on error.** `StateMachine::apply` — the public
+method a caller uses to add a transition — is a different method from
+`Transition::apply`; it's the only code that ever hands out `&mut
+self.current` to the latter. It mutates `current` directly rather
+than through a scratch clone; it's the hot path, and the expected case
+is that the transition's `apply` succeeds, so there's nothing extra to
+pay for most of the time. The risk is that when `apply` *does* return
+`Err`, it may have already mutated `state` partway (the trait doesn't
+require otherwise — requiring every implementation, including
+third-party ones, to hand-write a correct "no effect on failure" guarantee
+was rejected as the same kind of burden undo already avoids placing on
+transition authors). So on `Err`, `current` is no longer trustworthy and
+is recomputed from scratch: replay every still-active entry, in log order,
+into a fresh `S::default()` — the same replay `undo` uses below — and
+install that as `current` before returning the error to the caller. This
+recomputation itself cannot fail, because every entry being replayed was
+already active and successfully applied before this call started, and
+`apply` is required to be deterministic. The failed transition is never
+appended to the log, so it plays no part in this recomputation.
+
+`undo` can't use the cheap direct-mutation path at all, because it has to
+test a *hypothetical* active set before committing to it — the target
+being undone might invalidate something later, and discovering that must
+not touch `current` for real. So `undo` always replays into a fresh
+`S::default()` first and only swaps the result in as `current` once
+the entire replay has succeeded, leaving `current` and the log untouched
+on failure.
 
 **Computing what's active.** Because an `Undo` can itself be undone, "is
 this entry in effect" isn't just "was it ever undone" — it's "was it
@@ -74,24 +126,27 @@ walking the log from the back to the front, maintaining a
 This gives "undo of an undo" as redo for free: `Undo(U)` where `U` is
 itself `Undo(T)` — if the new undo is active, it cancels `U`, which means
 `U` no longer cancels `T`, so `T` becomes active again. No separate redo
-mechanism is needed. `current` is then just the result of replaying every
-active `Apply` entry, in log order, from `initial` (`Undo` entries are
-no-ops for `apply` — their effect is structural, handled by the
-active-set computation above, not by mutating state themselves).
+mechanism is needed. `current` is then obtained by taking a fresh
+`S::default()` and mutating it in place by applying every
+active `Apply` entry, in log order (`Undo` entries are no-ops for `apply`
+— their effect is structural, handled by the active-set computation
+above, not by mutating state themselves).
 
 **Validation before commit.** `undo(target: TransitionId)` must check,
 before it takes effect, that the resulting active set still replays
 cleanly — a later active transition may have depended on the one being
 targeted. Recompute the active set as if the new `Undo` entry were
-appended, and replay forward; only if the whole replay succeeds does the
-state machine actually append the entry and update `current`. If any
-later active transition's `apply` now fails, reject with an error naming
-the first transition that broke, and leave the log/state untouched —
-exactly the same atomicity guarantee whether the target is at the tail or
-buried in the middle.
+appended, and replay forward starting from a fresh `S::default()`; only if
+the whole replay succeeds does the state machine actually append the
+entry and swap that result in as the new `current`. If any later
+active transition's `apply` now fails, reject with an error naming the
+first transition that broke, and leave the log/`current` untouched —
+because the replay only ever mutated the scratch value, not `current`,
+this gives the same atomicity guarantee whether the target is at the tail
+or buried in the middle.
 
 ```rust
-impl<S: Clone, E> StateMachine<S, E> {
+impl<S: Default, E> StateMachine<S, E> {
     pub fn apply(&mut self, transition: Box<dyn Transition<S, E>>) -> Result<TransitionId, E>;
     pub fn undo(&mut self, target: TransitionId) -> Result<TransitionId, UndoError<E>>;
     pub fn undo_last(&mut self) -> Result<TransitionId, UndoError<E>>; // undoes whatever is currently the most recent active entry
@@ -113,8 +168,8 @@ callers should use once transitions can arrive out of order.
 Recomputing the active set and replaying is O(log length) per call, which
 is simplest for v1. If profiling later shows this is too slow or
 memory-heavy at typical log sizes, periodic snapshots (recompute from the
-nearest snapshot's active set + state instead of from `initial`) can be
-added additively, without changing this API.
+nearest snapshot's active set + state instead of from `S::default()`) can
+be added additively, without changing this API.
 
 ## Alternatives
 
