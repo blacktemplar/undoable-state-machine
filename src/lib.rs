@@ -1,14 +1,14 @@
 #![doc = include_str!("../README.md")]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 
 use uuid::Uuid;
 
 /// Identifies a single [`LogEntry`] so a later entry can target it via [`LogEntryKind::Undo`].
 ///
-/// Caller-assigned via [`TransitionId::new`]. Must be globally unique across a single
-/// [`StateMachine`]'s log; this is not currently enforced and is the caller's responsibility.
+/// Caller-assigned via [`TransitionId::new`]. Must be unique across a single [`StateMachine`]'s
+/// log.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TransitionId(Uuid);
 
@@ -19,6 +19,7 @@ impl Default for TransitionId {
 }
 
 impl TransitionId {
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -77,10 +78,16 @@ pub enum StateMachineError {
     Transition(TransitionId, TransitionError),
     /// An `Undo` targeted an id not present anywhere earlier in the log.
     UnknownTarget(TransitionId),
+    /// An entry's id already appears earlier in the log. [`TransitionId`] must be unique, reusing
+    /// one would make `Undo` targets ambiguous.
+    DuplicateId(TransitionId),
 }
 
 pub struct StateMachine<S, T> {
     log: Vec<LogEntry<T>>,
+    /// Every id currently in `log`, kept in sync with it so id lookups (duplicate rejection,
+    /// `Undo` target existence) are O(1) instead of a linear scan over a potentially long log.
+    known_ids: HashSet<TransitionId>,
     current: S,
 }
 
@@ -101,10 +108,6 @@ impl<S, T> StateMachine<S, T> {
     pub fn log(&self) -> &[LogEntry<T>] {
         &self.log
     }
-
-    fn contains_id(&self, id: TransitionId) -> bool {
-        self.log.iter().any(|entry| entry.id == id)
-    }
 }
 
 impl<S: Default, T> StateMachine<S, T> {
@@ -112,9 +115,11 @@ impl<S: Default, T> StateMachine<S, T> {
     /// entries.
     ///
     /// Use [`Self::build`] to reconstruct a state machine from an existing log instead.
+    #[must_use]
     pub fn new() -> Self {
         Self {
-            log: Default::default(),
+            log: Vec::default(),
+            known_ids: HashSet::default(),
             current: Default::default(),
         }
     }
@@ -130,10 +135,21 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// # Errors
     ///
     /// Returns an error under the same conditions as [`Self::apply`]'s `Undo` case: an unknown
-    /// undo target, or an active transition that fails to apply.
+    /// undo target, or an active transition that fails to apply. Also returns
+    /// [`StateMachineError::DuplicateId`] if two entries in `log` share the same id.
     pub fn build(log: Vec<LogEntry<T>>) -> Result<Self, StateMachineError> {
+        let mut known_ids = HashSet::with_capacity(log.len());
+        for entry in &log {
+            if !known_ids.insert(entry.id) {
+                return Err(StateMachineError::DuplicateId(entry.id));
+            }
+        }
         let current = Self::replay(&log)?;
-        Ok(Self { log, current })
+        Ok(Self {
+            log,
+            known_ids,
+            current,
+        })
     }
 
     /// Applies `entry` and appends it to the log. On error, the log and [`Self::current`] are
@@ -151,12 +167,23 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// Returns [`StateMachineError::Transition`] if the transition (for `Apply`) or some later
     /// active entry that depended on the target (for `Undo`) fails;
     /// [`StateMachineError::UnknownTarget`] if `Undo` targets an id not present earlier in the
+    /// log. Returns [`StateMachineError::DuplicateId`] if `entry`'s id already appears in the
     /// log.
+    ///
+    /// # Panics
+    ///
+    /// Panics if healing the state after a failed `apply` (see [`Transition::apply`]'s
+    /// determinism contract) itself fails to replay. This indicates a `Transition` impl that
+    /// violates that contract, not a reachable failure under a correct one.
     pub fn apply(&mut self, entry: LogEntry<T>) -> Result<(), StateMachineError> {
+        if self.known_ids.contains(&entry.id) {
+            return Err(StateMachineError::DuplicateId(entry.id));
+        }
         match &entry.kind {
             LogEntryKind::Apply(transition) => match transition.check_applicable(&self.current) {
                 Ok(()) => match transition.apply(&mut self.current) {
                     Ok(()) => {
+                        self.known_ids.insert(entry.id);
                         self.log.push(entry);
                         Ok(())
                     }
@@ -173,7 +200,8 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
                 Err(err) => Err(StateMachineError::Transition(entry.id, err)),
             },
             LogEntryKind::Undo(target) => {
-                if !self.contains_id(*target) {
+                let id = entry.id;
+                if !self.known_ids.insert(id) {
                     return Err(StateMachineError::UnknownTarget(*target));
                 }
                 self.log.push(entry);
@@ -184,6 +212,7 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
                     }
                     Err(err) => {
                         self.log.pop();
+                        self.known_ids.remove(&id);
                         Err(err)
                     }
                 }
@@ -319,7 +348,9 @@ mod tests {
 
         match err {
             StateMachineError::Transition(id, _) => assert_eq!(id, failing_id),
-            _ => panic!("expected StateMachineError::Transition"),
+            StateMachineError::UnknownTarget(_) | StateMachineError::DuplicateId(_) => {
+                panic!("expected StateMachineError::Transition")
+            }
         }
         assert_eq!(*sm.current(), 5);
         assert_eq!(sm.log().len(), 1);
@@ -342,7 +373,9 @@ mod tests {
                 assert_eq!(id, failing_id);
                 assert_eq!(err.to_string(), "boom");
             }
-            _ => panic!("expected StateMachineError::Transition"),
+            StateMachineError::UnknownTarget(_) | StateMachineError::DuplicateId(_) => {
+                panic!("expected StateMachineError::Transition")
+            }
         }
         // The failing entry is never recorded in the log. `current` was
         // already mutated by `apply` before it failed though, so per
@@ -420,7 +453,9 @@ mod tests {
 
         match err {
             StateMachineError::Transition(id, _) => assert_eq!(id, guard_id),
-            _ => panic!("expected AppendError::Transition"),
+            StateMachineError::UnknownTarget(_) | StateMachineError::DuplicateId(_) => {
+                panic!("expected StateMachineError::Transition")
+            }
         }
         // The undo itself is rejected: current and the log are unaffected.
         assert_eq!(*sm.current(), 10);
