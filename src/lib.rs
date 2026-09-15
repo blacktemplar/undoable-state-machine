@@ -268,12 +268,15 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     ///     }
     /// }
     ///
-    /// let log: Vec<LogEntry<Box<dyn Transition<i64>>>> = vec![LogEntry::new(
-    ///     TransitionId::new(),
-    ///     LogEntryKind::Apply(Box::new(Add(5))),
-    /// )];
+    /// let add_7_transition_id = TransitionId::new();
+    /// let log: Vec<LogEntry<Box<dyn Transition<i64>>>> = vec![
+    ///     LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(5)))),
+    ///     LogEntry::new(add_7_transition_id, LogEntryKind::Apply(Box::new(Add(7)))),
+    ///     LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(-3)))),
+    ///     LogEntry::new(TransitionId::new(), LogEntryKind::Undo(add_7_transition_id)),
+    /// ];
     /// let sm = StateMachine::build(log)?;
-    /// assert_eq!(*sm.current(), 5);
+    /// assert_eq!(*sm.current(), 2);
     /// # Ok::<(), StateMachineError>(())
     /// ```
     ///
@@ -334,6 +337,22 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     ///     LogEntryKind::Apply(Box::new(Add(5))),
     /// ))?;
     /// assert_eq!(*sm.current(), 5);
+    /// let add_7_transition_id = TransitionId::new();
+    /// sm.apply(LogEntry::new(
+    ///     add_7_transition_id,
+    ///     LogEntryKind::Apply(Box::new(Add(7))),
+    /// ))?;
+    /// assert_eq!(*sm.current(), 12);
+    /// sm.apply(LogEntry::new(
+    ///     TransitionId::new(),
+    ///     LogEntryKind::Apply(Box::new(Add(-3))),
+    /// ))?;
+    /// assert_eq!(*sm.current(), 9);
+    /// sm.apply(LogEntry::new(
+    ///     TransitionId::new(),
+    ///     LogEntryKind::Undo(add_7_transition_id),
+    /// ))?;
+    /// assert_eq!(*sm.current(), 2);
     /// # Ok::<(), StateMachineError>(())
     /// ```
     ///
