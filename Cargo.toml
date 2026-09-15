@@ -2,6 +2,13 @@
 name = "undoable-state-machine"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A generic, undoable state machine backed by an append-only log, where undo is just another log entry."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["state-machine", "undo", "redo", "log"]
+categories = ["data-structures", "algorithms"]
+exclude = ["PUBLISHING_PLAN.md"]
 
 [dependencies]
 uuid = { version = "1.26.1", features = ["v4", "fast-rng"] }
