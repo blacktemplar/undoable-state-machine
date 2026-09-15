@@ -239,6 +239,7 @@ impl<S: Default, T> StateMachine<S, T> {
         }
     }
 }
+
 impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// Reconstructs a state machine from a previously recorded log, e.g. one persisted elsewhere
     /// or merged from multiple sources.
