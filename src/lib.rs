@@ -1,8 +1,10 @@
 #![doc = include_str!("../README.md")]
 
-use std::collections::{HashMap, HashSet};
-use std::error::Error;
-use std::fmt;
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt,
+};
 
 use uuid::Uuid;
 
@@ -266,9 +268,10 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     ///     }
     /// }
     ///
-    /// let log: Vec<LogEntry<Box<dyn Transition<i64>>>> = vec![
-    ///     LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(5)))),
-    /// ];
+    /// let log: Vec<LogEntry<Box<dyn Transition<i64>>>> = vec![LogEntry::new(
+    ///     TransitionId::new(),
+    ///     LogEntryKind::Apply(Box::new(Add(5))),
+    /// )];
     /// let sm = StateMachine::build(log)?;
     /// assert_eq!(*sm.current(), 5);
     /// # Ok::<(), StateMachineError>(())
@@ -326,7 +329,10 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// }
     ///
     /// let mut sm = StateMachine::<i64, Box<dyn Transition<i64>>>::new();
-    /// sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(5)))))?;
+    /// sm.apply(LogEntry::new(
+    ///     TransitionId::new(),
+    ///     LogEntryKind::Apply(Box::new(Add(5))),
+    /// ))?;
     /// assert_eq!(*sm.current(), 5);
     /// # Ok::<(), StateMachineError>(())
     /// ```
@@ -437,8 +443,9 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use proptest::strategy::Strategy;
+
+    use super::*;
 
     struct Add(i64);
 
