@@ -24,8 +24,8 @@ impl TransitionId {
     }
 }
 
-/// Transitions are dynamically dispatched, so their errors are too — a log
-/// can freely mix transitions with unrelated error types.
+/// Typically a log will contain many different transitions (using `Box<dyn Transition<S> + ...>`)
+/// which can also return many different types of errors.
 pub type TransitionError = Box<dyn Error + Send + Sync>;
 
 /// A transition that mutates state, split into a pure pre-check and the mutation itself.
@@ -62,8 +62,8 @@ pub struct LogEntry<T> {
 
 /// Represents applying a transition or undoing a previous transition.
 ///
-/// Undo is just another log entry, which is what makes undo itself undoable — undoing an `Undo`
-/// reactivates its target, giving redo for free with no separate mechanism.
+/// Undo is just another log entry, which is what makes undo itself undoable. Undoing an `Undo`
+/// reactivates its target, which is basically a redo.
 pub enum LogEntryKind<T> {
     Apply(T),
     /// Undoes the transition with the given id
@@ -139,6 +139,13 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// Applies `entry` and appends it to the log. On error, the log and [`Self::current`] are
     /// left unchanged.
     ///
+    /// If the logs contain undos then calling this method is more efficient than applying all
+    /// entries one by one with [`Self::apply`] since undone entries will never get applied in the
+    /// first place. Note, however that this changes the semantics in case an undone entry would
+    /// error. If you call [`Self::apply`] for each entry then it would error before applying the
+    /// undo, while [`Self::apply`] fully ignores the undone entry and never applies it and never
+    /// surfaces the error.
+    ///
     /// # Errors
     ///
     /// Returns [`StateMachineError::Transition`] if the transition (for `Apply`) or some later
@@ -156,7 +163,7 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
                     Err(err) => {
                         // we need to replay the state
                         // `active` is exactly what it was before this call, and that already
-                        // replayed cleanly to produce the old `current` — so re-replaying it here
+                        // replayed cleanly to produce the old `current`, so re-replaying it here
                         // cannot fail.
                         self.current = Self::replay(&self.log)
                             .expect("previously-active entries must still replay");
@@ -185,33 +192,6 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     }
 
     /// Replays every active log entry onto a fresh `S::default()`.
-    ///
-    /// If the logs contain undos then calling this method is more efficient than applying all
-    /// entries one by one with [`Self::apply`] since undone entries will never get applied in the
-    /// first place. Note, however that this changes the semantics in case an undone entry would
-    /// error. If you call [`Self::apply`] for each entry then it would error before applying the
-    /// undo, while [`Self::replay`] fully ignores the undone entry and never applies it and never
-    /// surfaces the error.
-    ///
-    /// # Computing what's active
-    ///
-    /// Because an `Undo` entry can itself be undone, "is this entry in effect" isn't just "was it
-    /// ever undone" — it's "was it undone by something that is *itself* still active." This is
-    /// resolved by walking the log from back to front while maintaining a set of cancelled ids:
-    ///
-    /// - An entry is active iff its own id isn't already cancelled (i.e. nothing later and
-    ///   still-active targeted it).
-    /// - If an active entry is `Undo(target)`, `target` becomes cancelled.
-    /// - If an entry isn't active, it has no effect at all — so if it's an `Undo`, it does *not*
-    ///   cancel its target either.
-    ///
-    /// This gives "undo of an undo" as redo for free: `Undo(U)` where `U` is itself `Undo(T)` — if
-    /// the new undo is active, it cancels `U`, which means `U` no longer cancels `T`, so `T`
-    /// becomes active again. No separate redo mechanism is needed.
-    ///
-    /// `current` is then obtained by applying every active `Apply` entry, in log order, onto a
-    /// fresh `S::default()` (`Undo` entries are no-ops for this forward pass; their effect is
-    /// structural, handled entirely by the active-set computation above).
     ///
     /// # Errors
     ///
@@ -277,7 +257,7 @@ mod tests {
     }
 
     // Always reports itself as applicable, then fails inside `apply` after
-    // already mutating `state` — models a transition whose `apply` breaks the
+    // already mutating `state`. Models a transition whose `apply` breaks the
     // "should be rare/avoided" guidance, to exercise that failure path.
     struct FailDuringApply(i64);
 
@@ -292,7 +272,7 @@ mod tests {
         }
     }
 
-    // Not applicable unless `state` is already at least `self.0` — used to make a
+    // Not applicable unless `state` is already at least `self.0`. Used to make a
     // later entry's success depend on an earlier one still being active.
     struct RequireAtLeast(i64);
 
@@ -367,7 +347,7 @@ mod tests {
         // The failing entry is never recorded in the log. `current` was
         // already mutated by `apply` before it failed though, so per
         // `Transition::apply`'s contract it must now be treated as dirty and
-        // not relied upon — recovery means rebuilding from the (unaffected) log.
+        // not relied upon. Recovery means rebuilding from the (unaffected) log.
         assert_eq!(sm.log().len(), 1);
 
         let rebuilt = StateMachine::<i64, I64Transition>::build(vec![apply_entry(5)]).unwrap();
