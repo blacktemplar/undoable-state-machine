@@ -49,4 +49,13 @@ assert_eq!(*sm.current(), 8);
 sm.apply(LogEntry { id: TransitionId::new(), kind: LogEntryKind::Undo(first_id) })
     .unwrap();
 assert_eq!(*sm.current(), 3);
+
+// `StateMachine::build` reconstructs a state machine from a previously
+// recorded log, e.g. one persisted elsewhere.
+let persisted: Vec<LogEntry<Box<dyn Transition<i64>>>> = vec![
+    LogEntry { id: TransitionId::new(), kind: LogEntryKind::Apply(Box::new(Add(1))) },
+    LogEntry { id: TransitionId::new(), kind: LogEntryKind::Apply(Box::new(Add(2))) },
+];
+let restored = StateMachine::<i64, Box<dyn Transition<i64>>>::build(persisted).unwrap();
+assert_eq!(*restored.current(), 3);
 ```

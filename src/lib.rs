@@ -275,6 +275,7 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::strategy::Strategy;
 
     struct Add(i64);
 
@@ -322,6 +323,27 @@ mod tests {
 
         fn apply(&self, _state: &mut i64) -> Result<(), TransitionError> {
             Ok(())
+        }
+    }
+
+    // Passes `check_applicable` unconditionally, but `apply` fails unless
+    // `state` is already at least `self.0`. Unlike `RequireAtLeast`, this
+    // makes the *dependency* break surface from `apply` instead of
+    // `check_applicable`.
+    struct FailApplyIfBelow(i64);
+
+    impl Transition<i64> for FailApplyIfBelow {
+        fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+            Ok(())
+        }
+
+        fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+            if *state < self.0 {
+                Err(format!("need at least {} to apply, have {}", self.0, state).into())
+            } else {
+                *state += 1;
+                Ok(())
+            }
         }
     }
 
@@ -469,6 +491,85 @@ mod tests {
     }
 
     #[test]
+    fn undo_that_breaks_a_later_entrys_apply_is_rejected_and_blames_that_entry() {
+        let mut sm = StateMachine::<i64, I64Transition>::default();
+
+        let add: LogEntry<I64Transition> = LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Apply(Box::new(Add(10))),
+        };
+        let add_id = add.id;
+        sm.apply(add).unwrap();
+
+        // Succeeds now, while `add`'s effect keeps `state` at least 10, but
+        // its `check_applicable` doesn't encode that dependency - only its
+        // `apply` does.
+        let guard: LogEntry<I64Transition> = LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Apply(Box::new(FailApplyIfBelow(10))),
+        };
+        let guard_id = guard.id;
+        sm.apply(guard).unwrap();
+        assert_eq!(*sm.current(), 11);
+
+        let err = sm
+            .apply(LogEntry {
+                id: TransitionId::new(),
+                kind: LogEntryKind::Undo(add_id),
+            })
+            .unwrap_err();
+
+        match err {
+            StateMachineError::Transition(id, _) => assert_eq!(id, guard_id),
+            StateMachineError::UnknownTarget(_) | StateMachineError::DuplicateId(_) => {
+                panic!("expected StateMachineError::Transition")
+            }
+        }
+        // The undo itself is rejected: current and the log are unaffected.
+        assert_eq!(*sm.current(), 11);
+        assert_eq!(sm.log().len(), 2);
+    }
+
+    #[test]
+    fn apply_rejects_a_duplicate_id() {
+        let mut sm = StateMachine::<i64, I64Transition>::default();
+        let entry = apply_entry(5);
+        let id = entry.id;
+        sm.apply(entry).unwrap();
+
+        let dup: LogEntry<I64Transition> = LogEntry {
+            id,
+            kind: LogEntryKind::Apply(Box::new(Add(3))),
+        };
+        let err = sm.apply(dup).unwrap_err();
+
+        match err {
+            StateMachineError::DuplicateId(dup_id) => assert_eq!(dup_id, id),
+            StateMachineError::UnknownTarget(_) | StateMachineError::Transition(_, _) => {
+                panic!("expected StateMachineError::DuplicateId")
+            }
+        }
+        assert_eq!(*sm.current(), 5);
+        assert_eq!(sm.log().len(), 1);
+    }
+
+    #[test]
+    fn build_rejects_a_duplicate_id() {
+        let a = apply_entry(5);
+        let id = a.id;
+        let b: LogEntry<I64Transition> = LogEntry {
+            id,
+            kind: LogEntryKind::Apply(Box::new(Add(3))),
+        };
+
+        match StateMachine::<i64, I64Transition>::build(vec![a, b]) {
+            Err(StateMachineError::DuplicateId(dup_id)) => assert_eq!(dup_id, id),
+            Ok(_) => panic!("expected build to fail"),
+            Err(other) => panic!("expected StateMachineError::DuplicateId, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_computes_current_from_a_log() {
         let a = apply_entry(5);
         let a_id = a.id;
@@ -550,5 +651,79 @@ mod tests {
         let sm = StateMachine::build(vec![a, undo_a, undo_undo_a]).unwrap();
 
         assert_eq!(*sm.current(), 5);
+    }
+
+    /// What a random `apply` call in the property test below does: either
+    /// append a new `Add`, or undo a previously-appended entry (picked by
+    /// index into `all_ids`, wrapped so every index is valid).
+    #[derive(Clone, Debug)]
+    enum RandomOp {
+        Apply(i64),
+        Undo(usize),
+    }
+
+    enum MirrorKind {
+        Apply(i64),
+        Undo(TransitionId),
+    }
+
+    proptest::proptest! {
+        // The crate's core invariant: `current()` is always exactly what
+        // you'd get by replaying the log's active set from scratch. We
+        // check it after every step of a random sequence of applies/undos,
+        // rebuilding independently via `StateMachine::build` from a mirror
+        // of the entries the state machine actually accepted.
+        #[test]
+        fn current_matches_a_from_scratch_replay_of_the_log(
+            ops in proptest::collection::vec(
+                proptest::prop_oneof![
+                    (-1_000_000i64..1_000_000i64).prop_map(RandomOp::Apply),
+                    proptest::prelude::any::<usize>().prop_map(RandomOp::Undo),
+                ],
+                0..50,
+            )
+        ) {
+            let mut sm = StateMachine::<i64, I64Transition>::default();
+            let mut mirror: Vec<(TransitionId, MirrorKind)> = Vec::new();
+            let mut all_ids: Vec<TransitionId> = Vec::new();
+
+            for op in ops {
+                let id = TransitionId::new();
+                let (kind, mirror_kind) = match op {
+                    RandomOp::Apply(v) => (
+                        LogEntryKind::Apply(Box::new(Add(v)) as I64Transition),
+                        MirrorKind::Apply(v),
+                    ),
+                    RandomOp::Undo(idx) => {
+                        if all_ids.is_empty() {
+                            continue;
+                        }
+                        let target = all_ids[idx % all_ids.len()];
+                        (LogEntryKind::Undo(target), MirrorKind::Undo(target))
+                    }
+                };
+
+                if sm.apply(LogEntry { id, kind }).is_ok() {
+                    mirror.push((id, mirror_kind));
+                    all_ids.push(id);
+                }
+
+                let rebuilt_log: Vec<LogEntry<I64Transition>> = mirror
+                    .iter()
+                    .map(|(id, kind)| {
+                        let kind = match kind {
+                            MirrorKind::Apply(v) => {
+                                LogEntryKind::Apply(Box::new(Add(*v)) as I64Transition)
+                            }
+                            MirrorKind::Undo(target) => LogEntryKind::Undo(*target),
+                        };
+                        LogEntry { id: *id, kind }
+                    })
+                    .collect();
+                let rebuilt = StateMachine::<i64, I64Transition>::build(rebuilt_log).unwrap();
+
+                proptest::prop_assert_eq!(*sm.current(), *rebuilt.current());
+            }
+        }
     }
 }
