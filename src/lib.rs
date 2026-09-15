@@ -23,39 +23,34 @@ impl TransitionId {
 pub type TransitionError = Box<dyn Error + Send + Sync>;
 
 /// A transition that modifies state and can potentially error.
-///
-/// # Safety
-///
-/// Implementors must return `Err((false, _))` only if `state` was not
-/// modified at all. Returning `Err((true, _))` is always sound, even if
-/// `state` happens to be untouched — it only costs the caller an
-/// unnecessary rebuild.
-pub unsafe trait Transition<S> {
+pub trait Transition<S> {
+    /// Checks if the transition is applicable to the given state. This is used as a pre-check to
+    /// prevent errors during mutating the state (which would invalidate the state).
+    fn check_applicable(&self, state: &S) -> Result<(), TransitionError>;
+
     /// Applies the transition by mutating `state` in place.
     ///
     /// Must produce the same mutation for the same input state, every time.
     ///
-    /// On error, the returned `bool` indicates whether `state` was left
-    /// dirty (partially modified).
+    /// [`Transition::apply`] should only be called if [`Transition::check_applicable`] returned
+    /// `Ok(())`. Therefore, implementers of `apply` can assume that [`Transition::check_applicable`]
+    /// just returned `Ok(())`.
     ///
-    /// # Safety
+    /// If this method returns an error callers should treat the state as dirty and don't use it
+    /// anymore as there is no guarantee to its content. If they want to replay the full log.
     ///
-    /// If this returns `Err((true, _))`, the caller must treat `state` as
-    /// invalid and discard/rebuild it rather than continue using it —
-    /// `state` is only guaranteed consistent when this returns `Ok` or
-    /// `Err((false, _))`.
-    unsafe fn apply(&self, state: &mut S) -> Result<(), (bool, TransitionError)>;
+    /// Since replaying can be costly errors should be rare and should be avoided if possible by
+    /// catching problems early in [`Transition::check_applicable`].
+    fn apply(&self, state: &mut S) -> Result<(), TransitionError>;
 }
 
 /// Useful when using `Box<dyn Transition<...> + ...>` as `T` in [`StateMachine`]
-// Given that we just forward apply to the inner state that also implements `Transition<S>` the
-// safety of this implementation is implied by the safety of the implementation of the inner type
-// `T`.
-unsafe impl<S, T: ?Sized + Transition<S>> Transition<S> for Box<T> {
-    unsafe fn apply(&self, state: &mut S) -> Result<(), (bool, TransitionError)> {
-        // We just forward the result here so the caller of this unsafe function is
-        // responsible for cleaning up dirty state.
-        unsafe { (**self).apply(state) }
+impl<S, T: ?Sized + Transition<S>> Transition<S> for Box<T> {
+    fn check_applicable(&self, state: &S) -> Result<(), TransitionError> {
+        (**self).check_applicable(state)
+    }
+    fn apply(&self, state: &mut S) -> Result<(), TransitionError> {
+        (**self).apply(state)
     }
 }
 
@@ -95,8 +90,6 @@ impl<S: Default, T> Default for StateMachine<S, T> {
 }
 
 impl<S, T> StateMachine<S, T> {
-    /// The only way to mutate `current` from outside this crate is through
-    /// `append`/`rebuild`; this returns a read-only view.
     pub fn current(&self) -> &S {
         &self.current
     }
@@ -124,33 +117,28 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
         Ok(Self { log, current })
     }
 
-    /// Appends a single entry to the end of the log. This is the local,
-    /// speculative path: it does not know about entries other clients may
-    /// still be syncing in, and assumes `entry` belongs after everything
-    /// already in the log.
-    pub fn append(&mut self, entry: LogEntry<T>) -> Result<(), StateMachineError> {
+    /// Applies the `entry` and appends it to the log. In case of an error the state will be
+    /// unmodified (i.e. the [`Self::log`] as well as [`Self::current`] will be as before this
+    /// call).
+    pub fn apply(&mut self, entry: LogEntry<T>) -> Result<(), StateMachineError> {
         match &entry.kind {
-            LogEntryKind::Apply(transition) =>
-            // SAFETY: This is safe as we clean up the state in self.current if apply returns an
-            // error that indicates a dirty state
-            unsafe {
-                match transition.apply(&mut self.current) {
+            LogEntryKind::Apply(transition) => match transition.check_applicable(&self.current) {
+                Ok(()) => match transition.apply(&mut self.current) {
                     Ok(()) => {
                         self.log.push(entry);
                         Ok(())
                     }
-                    Err((dirty, err)) => {
-                        if dirty {
-                            // we need to replay the state
-                            // `active` is exactly what it was before this call, and
-                            // that already replayed cleanly to produce the old
-                            // `current` — so re-replaying it here cannot fail.
-                            self.current = Self::replay(&self.log)
-                                .expect("previously-active entries must still replay");
-                        }
+                    Err(err) => {
+                        // we need to replay the state
+                        // `active` is exactly what it was before this call, and that already
+                        // replayed cleanly to produce the old `current` — so re-replaying it here
+                        // cannot fail.
+                        self.current = Self::replay(&self.log)
+                            .expect("previously-active entries must still replay");
                         Err(StateMachineError::Transition(entry.id, err))
                     }
-                }
+                },
+                Err(err) => Err(StateMachineError::Transition(entry.id, err)),
             },
             LogEntryKind::Undo(target) => {
                 if !self.contains_id(*target) {
@@ -171,11 +159,14 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
         }
     }
 
-    // Replays every active `Apply` entry, in log order, into a fresh
-    // `S::default()`. Undoing an entry can uncover a state under which a
-    // later, previously-successful entry no longer applies cleanly (e.g. it
-    // depended on the undone entry's effect) — callers must not assume this
-    // succeeds just because every entry succeeded when first appended.
+    /// Replays every active log entry onto a fresh `S::default()`.
+    ///
+    /// If the logs contain undos then calling this method is more efficient than applying all
+    /// entries one by one with [`Self::apply`] since undone entries will never get applied in the
+    /// first place. Note, however that this changes the semantics in case an undone entry would
+    /// error. If you call [`Self::apply`] for each entry then it would error before applying the
+    /// undo, while [`Self::replay`] fully ignores the undone entry and never applies it and never
+    /// surfaces the error.
     fn replay(entries: &[LogEntry<T>]) -> Result<S, StateMachineError> {
         // the keys are the cancelled transition ids the values are if we found them later on
         let mut cancelled = HashMap::new();
@@ -203,11 +194,12 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
             let LogEntryKind::Apply(transition) = &entry.kind else {
                 unreachable!("We only added apply kinds to active")
             };
-            // SAFETY: This is safe as we will always throw away the `state` in case of an error
-            // (guaranteed by the question mark that returns an error not containing the state and
-            // therefore the state gets discarded.
-            unsafe { transition.apply(&mut state) }
-                .map_err(|(_, err)| StateMachineError::Transition(entry.id, err))?;
+            transition
+                .check_applicable(&state)
+                .map_err(|err| StateMachineError::Transition(entry.id, err))?;
+            transition
+                .apply(&mut state)
+                .map_err(|err| StateMachineError::Transition(entry.id, err))?;
         }
 
         Ok(state)
@@ -222,37 +214,47 @@ mod tests {
 
     pub type I64Transition = Box<dyn Transition<i64>>;
 
-    // SAFETY: We never return an error
-    unsafe impl Transition<i64> for Add {
-        unsafe fn apply(&self, state: &mut i64) -> Result<(), (bool, TransitionError)> {
+    impl Transition<i64> for Add {
+        fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+            Ok(())
+        }
+
+        fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
             *state += self.0;
             Ok(())
         }
     }
 
-    struct FailAfterMutating(i64);
+    // Always reports itself as applicable, then fails inside `apply` after
+    // already mutating `state` — models a transition whose `apply` breaks the
+    // "should be rare/avoided" guidance, to exercise that failure path.
+    struct FailDuringApply(i64);
 
-    // SAFETY: We always indicate the state as dirty
-    unsafe impl Transition<i64> for FailAfterMutating {
-        unsafe fn apply(&self, state: &mut i64) -> Result<(), (bool, TransitionError)> {
+    impl Transition<i64> for FailDuringApply {
+        fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+            Ok(())
+        }
+
+        fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
             *state += self.0;
-            Err((true, "boom".to_string().into()))
+            Err("boom".to_string().into())
         }
     }
 
-    // Fails unless `state` is already at least `self.0` — used to make a
+    // Not applicable unless `state` is already at least `self.0` — used to make a
     // later entry's success depend on an earlier one still being active.
     struct RequireAtLeast(i64);
 
-    // SAFETY: We never mutate the state in this transition
-    unsafe impl Transition<i64> for RequireAtLeast {
-        unsafe fn apply(&self, state: &mut i64) -> Result<(), (bool, TransitionError)> {
+    impl Transition<i64> for RequireAtLeast {
+        fn check_applicable(&self, state: &i64) -> Result<(), TransitionError> {
             if *state < self.0 {
-                return Err((
-                    false,
-                    format!("need at least {}, have {}", self.0, state).into(),
-                ));
+                Err(format!("need at least {}, have {}", self.0, state).into())
+            } else {
+                Ok(())
             }
+        }
+
+        fn apply(&self, _state: &mut i64) -> Result<(), TransitionError> {
             Ok(())
         }
     }
@@ -267,35 +269,58 @@ mod tests {
     #[test]
     fn append_success_updates_current() {
         let mut sm = StateMachine::<i64, I64Transition>::default();
-        sm.append(apply_entry(5)).unwrap();
-        sm.append(apply_entry(3)).unwrap();
+        sm.apply(apply_entry(5)).unwrap();
+        sm.apply(apply_entry(3)).unwrap();
         assert_eq!(*sm.current(), 8);
     }
 
     #[test]
-    fn append_failure_heals_current_and_does_not_grow_log() {
+    fn append_rejects_a_not_applicable_transition_without_mutating_state() {
         let mut sm = StateMachine::<i64, I64Transition>::default();
-        sm.append(apply_entry(5)).unwrap();
+        sm.apply(apply_entry(5)).unwrap();
 
         let entry: LogEntry<I64Transition> = LogEntry {
             id: TransitionId::new(),
-            kind: LogEntryKind::Apply(Box::new(FailAfterMutating(100))),
+            kind: LogEntryKind::Apply(Box::new(RequireAtLeast(10))),
         };
         let failing_id = entry.id;
-        let err = sm.append(entry).unwrap_err();
+        let err = sm.apply(entry).unwrap_err();
+
+        match err {
+            StateMachineError::Transition(id, _) => assert_eq!(id, failing_id),
+            _ => panic!("expected StateMachineError::Transition"),
+        }
+        assert_eq!(*sm.current(), 5);
+        assert_eq!(sm.log().len(), 1);
+    }
+
+    #[test]
+    fn append_apply_failure_does_not_grow_log() {
+        let mut sm = StateMachine::<i64, I64Transition>::default();
+        sm.apply(apply_entry(5)).unwrap();
+
+        let entry: LogEntry<I64Transition> = LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Apply(Box::new(FailDuringApply(100))),
+        };
+        let failing_id = entry.id;
+        let err = sm.apply(entry).unwrap_err();
 
         match err {
             StateMachineError::Transition(id, err) => {
                 assert_eq!(id, failing_id);
                 assert_eq!(err.to_string(), "boom");
             }
-            _ => panic!("expected AppendError::Transition"),
+            _ => panic!("expected StateMachineError::Transition"),
         }
-        assert_eq!(*sm.current(), 5);
+        // The failing entry is never recorded in the log. `current` was
+        // already mutated by `apply` before it failed though, so per
+        // `Transition::apply`'s contract it must now be treated as dirty and
+        // not relied upon — recovery means rebuilding from the (unaffected) log.
         assert_eq!(sm.log().len(), 1);
 
-        sm.append(apply_entry(2)).unwrap();
-        assert_eq!(*sm.current(), 7);
+        let rebuilt = StateMachine::<i64, I64Transition>::build(vec![apply_entry(5)]).unwrap();
+        assert_eq!(*rebuilt.current(), 5);
     }
 
     #[test]
@@ -306,11 +331,11 @@ mod tests {
             kind: LogEntryKind::Apply(Box::new(Add(5))),
         };
         let first_id = first.id;
-        sm.append(first).unwrap();
-        sm.append(apply_entry(3)).unwrap();
+        sm.apply(first).unwrap();
+        sm.apply(apply_entry(3)).unwrap();
         assert_eq!(*sm.current(), 8);
 
-        sm.append(LogEntry {
+        sm.apply(LogEntry {
             id: TransitionId::new(),
             kind: LogEntryKind::Undo(first_id),
         })
@@ -322,10 +347,10 @@ mod tests {
     #[test]
     fn undo_of_unknown_target_is_rejected() {
         let mut sm = StateMachine::<i64, I64Transition>::default();
-        sm.append(apply_entry(5)).unwrap();
+        sm.apply(apply_entry(5)).unwrap();
 
         let err = sm
-            .append(LogEntry {
+            .apply(LogEntry {
                 id: TransitionId::new(),
                 kind: LogEntryKind::Undo(TransitionId::new()),
             })
@@ -345,7 +370,7 @@ mod tests {
             kind: LogEntryKind::Apply(Box::new(Add(10))),
         };
         let add_id = add.id;
-        sm.append(add).unwrap();
+        sm.apply(add).unwrap();
 
         // Only succeeds while `add`'s effect is still active.
         let guard: LogEntry<I64Transition> = LogEntry {
@@ -353,10 +378,10 @@ mod tests {
             kind: LogEntryKind::Apply(Box::new(RequireAtLeast(10))),
         };
         let guard_id = guard.id;
-        sm.append(guard).unwrap();
+        sm.apply(guard).unwrap();
 
         let err = sm
-            .append(LogEntry {
+            .apply(LogEntry {
                 id: TransitionId::new(),
                 kind: LogEntryKind::Undo(add_id),
             })
@@ -391,7 +416,7 @@ mod tests {
     fn build_surfaces_the_failing_transition() {
         let entry: LogEntry<I64Transition> = LogEntry {
             id: TransitionId::new(),
-            kind: LogEntryKind::Apply(Box::new(FailAfterMutating(100))),
+            kind: LogEntryKind::Apply(Box::new(FailDuringApply(100))),
         };
         let failing_id = entry.id;
 
