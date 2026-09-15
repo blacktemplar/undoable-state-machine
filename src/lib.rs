@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::fmt;
 
 use uuid::Uuid;
 
@@ -19,6 +20,16 @@ impl Default for TransitionId {
 }
 
 impl TransitionId {
+    /// Generates a new, randomly-assigned id.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use undoable_state_machine::TransitionId;
+    ///
+    /// let id = TransitionId::new();
+    /// assert_ne!(id, TransitionId::new());
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
@@ -30,6 +41,25 @@ impl TransitionId {
 pub type TransitionError = Box<dyn Error + Send + Sync>;
 
 /// A transition that mutates state, split into a pure pre-check and the mutation itself.
+///
+/// # Examples
+///
+/// ```
+/// use undoable_state_machine::{Transition, TransitionError};
+///
+/// struct Add(i64);
+///
+/// impl Transition<i64> for Add {
+///     fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+///         Ok(())
+///     }
+///
+///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+///         *state += self.0;
+///         Ok(())
+///     }
+/// }
+/// ```
 pub trait Transition<S> {
     /// Checks whether the transition is applicable to `state`, without mutating it.
     ///
@@ -61,17 +91,49 @@ impl<S, T: ?Sized + Transition<S>> Transition<S> for Box<T> {
 }
 
 /// One entry in a [`StateMachine`]'s append-only log.
+#[derive(Debug)]
 pub struct LogEntry<T> {
+    id: TransitionId,
+    kind: LogEntryKind<T>,
+}
+
+impl<T> LogEntry<T> {
+    /// Creates a new log entry with the given id and kind.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use undoable_state_machine::{LogEntry, LogEntryKind, TransitionId};
+    ///
+    /// let entry = LogEntry::new(TransitionId::new(), LogEntryKind::Apply(5));
+    /// match entry.kind() {
+    ///     LogEntryKind::Apply(v) => assert_eq!(*v, 5),
+    ///     LogEntryKind::Undo(_) => unreachable!(),
+    /// }
+    /// ```
+    #[must_use]
+    pub fn new(id: TransitionId, kind: LogEntryKind<T>) -> Self {
+        Self { id, kind }
+    }
+
     /// Uniquely identifies this entry so a later entry can target it via [`LogEntryKind::Undo`].
-    pub id: TransitionId,
-    pub kind: LogEntryKind<T>,
+    pub fn id(&self) -> TransitionId {
+        self.id
+    }
+
+    /// What this entry does: apply a transition, or undo a previous entry.
+    pub fn kind(&self) -> &LogEntryKind<T> {
+        &self.kind
+    }
 }
 
 /// Represents applying a transition or undoing a previous transition.
 ///
 /// Undo is just another log entry, which is what makes undo itself undoable. Undoing an `Undo`
 /// reactivates its target, which is basically a redo.
+#[derive(Debug)]
 pub enum LogEntryKind<T> {
+    /// Applies the given transition.
     Apply(T),
     /// Undoes the transition with the given id
     Undo(TransitionId),
@@ -89,12 +151,47 @@ pub enum StateMachineError {
     DuplicateId(TransitionId),
 }
 
+impl fmt::Display for StateMachineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StateMachineError::Transition(id, err) => {
+                write!(f, "transition {id:?} failed: {err}")
+            }
+            StateMachineError::UnknownTarget(id) => {
+                write!(f, "undo targets unknown transition {id:?}")
+            }
+            StateMachineError::DuplicateId(id) => {
+                write!(f, "transition id {id:?} already appears in the log")
+            }
+        }
+    }
+}
+
+impl Error for StateMachineError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            StateMachineError::Transition(_, err) => Some(err.as_ref()),
+            StateMachineError::UnknownTarget(_) | StateMachineError::DuplicateId(_) => None,
+        }
+    }
+}
+
 pub struct StateMachine<S, T> {
     log: Vec<LogEntry<T>>,
     /// Every id currently in `log`, kept in sync with it so id lookups (duplicate rejection,
     /// `Undo` target existence) are O(1) instead of a linear scan over a potentially long log.
     known_ids: HashSet<TransitionId>,
     current: S,
+}
+
+impl<S: fmt::Debug, T: fmt::Debug> fmt::Debug for StateMachine<S, T> {
+    // Omits the internal `known_ids` id cache, which is redundant with `log`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StateMachine")
+            .field("log", &self.log)
+            .field("current", &self.current)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S: Default, T> Default for StateMachine<S, T> {
@@ -121,6 +218,16 @@ impl<S: Default, T> StateMachine<S, T> {
     /// entries.
     ///
     /// Use [`Self::build`] to reconstruct a state machine from an existing log instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use undoable_state_machine::{StateMachine, Transition};
+    ///
+    /// let sm = StateMachine::<i64, Box<dyn Transition<i64>>>::new();
+    /// assert_eq!(*sm.current(), 0);
+    /// assert!(sm.log().is_empty());
+    /// ```
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -137,6 +244,35 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// Equivalent to starting from [`Self::new`] and calling [`Self::apply`] with each entry in
     /// order, but computes `current` in a single backward-then-forward pass instead of replaying
     /// the growing log again after every entry.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use undoable_state_machine::{
+    ///     LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition, TransitionError,
+    ///     TransitionId,
+    /// };
+    ///
+    /// struct Add(i64);
+    ///
+    /// impl Transition<i64> for Add {
+    ///     fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    ///         *state += self.0;
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let log: Vec<LogEntry<Box<dyn Transition<i64>>>> = vec![
+    ///     LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(5)))),
+    /// ];
+    /// let sm = StateMachine::build(log)?;
+    /// assert_eq!(*sm.current(), 5);
+    /// # Ok::<(), StateMachineError>(())
+    /// ```
     ///
     /// # Errors
     ///
@@ -167,6 +303,33 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// error. If you call [`Self::apply`] for each entry then it would error before applying the
     /// undo, while [`Self::apply`] fully ignores the undone entry and never applies it and never
     /// surfaces the error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use undoable_state_machine::{
+    ///     LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition, TransitionError,
+    ///     TransitionId,
+    /// };
+    ///
+    /// struct Add(i64);
+    ///
+    /// impl Transition<i64> for Add {
+    ///     fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    ///         *state += self.0;
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let mut sm = StateMachine::<i64, Box<dyn Transition<i64>>>::new();
+    /// sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(5)))))?;
+    /// assert_eq!(*sm.current(), 5);
+    /// # Ok::<(), StateMachineError>(())
+    /// ```
     ///
     /// # Errors
     ///
