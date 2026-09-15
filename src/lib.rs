@@ -32,6 +32,9 @@ pub type TransitionError = Box<dyn Error + Send + Sync>;
 /// A transition that mutates state, split into a pure pre-check and the mutation itself.
 pub trait Transition<S> {
     /// Checks whether the transition is applicable to `state`, without mutating it.
+    ///
+    /// # Errors
+    /// Returns an error if the transition is not applicable to the state.
     fn check_applicable(&self, state: &S) -> Result<(), TransitionError>;
 
     /// Applies the transition by mutating `state` in place.
@@ -41,6 +44,9 @@ pub trait Transition<S> {
     /// [`StateMachine::apply`] relies on this to recover by replaying the log if this method
     /// fails. On error, treat `state` as dirty and don't rely on its contents. Errors here
     /// should be rare - catch problems early in [`Transition::check_applicable`] instead.
+    ///
+    /// # Errors
+    /// An error occurs during mutation that was not caught in [`Transition::check_applicable`].
     fn apply(&self, state: &mut S) -> Result<(), TransitionError>;
 }
 
