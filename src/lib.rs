@@ -776,6 +776,29 @@ mod tests {
     }
 
     #[test]
+    fn build_with_undone_undo_computes_current() {
+        let a_id = TransitionId::new();
+        let a = LogEntry {
+            id: a_id,
+            kind: LogEntryKind::Apply(Box::new(Add(5))),
+        };
+        let undo_a_id = TransitionId::new();
+        let undo_a = LogEntry {
+            id: undo_a_id,
+            kind: LogEntryKind::Undo(a_id),
+        };
+        let undo_undo_a = LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Undo(undo_a_id),
+        };
+
+        let sm = StateMachine::build(vec![a, undo_a, undo_undo_a]).unwrap();
+
+        assert_eq!(*sm.current(), 5);
+        assert_eq!(sm.log().len(), 3);
+    }
+
+    #[test]
     fn build_surfaces_the_failing_transition() {
         let entry: LogEntry<I64Transition> = LogEntry {
             id: TransitionId::new(),
