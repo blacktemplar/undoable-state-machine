@@ -415,7 +415,7 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
         }
     }
 
-    /// Replays every active log entry onto a fresh `S::default()`.
+    /// Replays every active log entry, in log order, onto a fresh `S::default()`.
     ///
     /// # Errors
     ///
@@ -443,6 +443,11 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
                 return Err(StateMachineError::UnknownTarget(id));
             }
         }
+
+        // The scan above runs backwards (an `Undo` can only cancel an entry before it), so
+        // `active` came out newest-first. Transitions don't commute in general, they have to be
+        // applied in log order.
+        let active = active.into_iter().rev();
 
         let mut state = S::default();
         for entry in active {
@@ -542,6 +547,97 @@ mod tests {
             id: TransitionId::new(),
             kind: LogEntryKind::Apply(Box::new(Add(value))),
         }
+    }
+
+    // Appends a character to the state. Unlike `Add`, pushes don't commute, so
+    // replaying the active set in the wrong order shows up as a different
+    // string rather than the same number.
+    struct Push(char);
+
+    pub type StringTransition = Box<dyn Transition<String>>;
+
+    impl Transition<String> for Push {
+        fn check_applicable(&self, _state: &String) -> Result<(), TransitionError> {
+            Ok(())
+        }
+
+        fn apply(&self, state: &mut String) -> Result<(), TransitionError> {
+            state.push(self.0);
+            Ok(())
+        }
+    }
+
+    fn push_entry(c: char) -> LogEntry<StringTransition> {
+        LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Apply(Box::new(Push(c))),
+        }
+    }
+
+    #[test]
+    fn build_applies_active_transitions_in_log_order() {
+        let sm = StateMachine::<String, StringTransition>::build(vec![
+            push_entry('a'),
+            push_entry('b'),
+            push_entry('c'),
+        ])
+        .unwrap();
+
+        assert_eq!(sm.current(), "abc");
+    }
+
+    #[test]
+    fn undo_keeps_the_surviving_transitions_in_log_order() {
+        let mut sm = StateMachine::<String, StringTransition>::default();
+        sm.apply(push_entry('a')).unwrap();
+        let x = push_entry('x');
+        let x_id = x.id;
+        sm.apply(x).unwrap();
+        sm.apply(push_entry('b')).unwrap();
+        assert_eq!(sm.current(), "axb");
+
+        sm.apply(LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Undo(x_id),
+        })
+        .unwrap();
+
+        assert_eq!(sm.current(), "ab");
+    }
+
+    #[test]
+    fn build_reactivates_an_undone_entry_in_its_original_slot() {
+        let a = push_entry('a');
+        let x = push_entry('x');
+        let x_id = x.id;
+        let b = push_entry('b');
+        let undo_x = LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Undo(x_id),
+        };
+        let undo_x_id = undo_x.id;
+        let undo_undo_x = LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Undo(undo_x_id),
+        };
+
+        let undone = StateMachine::build(vec![a, x, b, undo_x]).unwrap();
+        assert_eq!(undone.current(), "ab");
+
+        let a = push_entry('a');
+        let x = LogEntry {
+            id: x_id,
+            kind: LogEntryKind::Apply(Box::new(Push('x')) as StringTransition),
+        };
+        let b = push_entry('b');
+        let undo_x = LogEntry {
+            id: undo_x_id,
+            kind: LogEntryKind::Undo(x_id),
+        };
+        let redone = StateMachine::build(vec![a, x, b, undo_x, undo_undo_x]).unwrap();
+
+        // `x` is active again, back in its original position - not appended at the end.
+        assert_eq!(redone.current(), "axb");
     }
 
     #[test]
@@ -938,5 +1034,96 @@ mod tests {
                 proptest::prop_assert_eq!(*sm.current(), *rebuilt.current());
             }
         }
+
+        // The same invariant, but checked against a model that shares no code
+        // with `replay` and over a transition that doesn't commute. Comparing
+        // `apply` against `build` (above) cannot see a replay that runs the
+        // active set in the wrong order, since both go through `replay`.
+        #[test]
+        fn current_matches_an_independent_model_of_the_active_set(
+            ops in proptest::collection::vec(
+                proptest::prop_oneof![
+                    proptest::char::range('a', 'z').prop_map(PushOp::Push),
+                    proptest::prelude::any::<usize>().prop_map(PushOp::Undo),
+                ],
+                0..50,
+            )
+        ) {
+            let mut sm = StateMachine::<String, StringTransition>::default();
+            let mut mirror: Vec<(TransitionId, PushKind)> = Vec::new();
+
+            for op in ops {
+                let id = TransitionId::new();
+                let kind = match op {
+                    PushOp::Push(c) => PushKind::Push(c),
+                    PushOp::Undo(idx) => {
+                        if mirror.is_empty() {
+                            continue;
+                        }
+                        PushKind::Undo(mirror[idx % mirror.len()].0)
+                    }
+                };
+                let entry = LogEntry {
+                    id,
+                    kind: match &kind {
+                        PushKind::Push(c) => {
+                            LogEntryKind::Apply(Box::new(Push(*c)) as StringTransition)
+                        }
+                        PushKind::Undo(target) => LogEntryKind::Undo(*target),
+                    },
+                };
+
+                // `Push` is applicable to any state and never fails, so no
+                // entry here can be rejected - every op lands in the log.
+                sm.apply(entry).unwrap();
+                mirror.push((id, kind));
+
+                proptest::prop_assert_eq!(sm.current(), &expected_state(&mirror));
+            }
+        }
+    }
+
+    /// What a random `apply` call in the property test above does, over
+    /// non-commuting `Push` transitions: either append a character, or undo a
+    /// previously-appended entry (picked by index into `mirror`, wrapped so
+    /// every index is valid).
+    #[derive(Clone, Debug)]
+    enum PushOp {
+        Push(char),
+        Undo(usize),
+    }
+
+    enum PushKind {
+        Push(char),
+        Undo(TransitionId),
+    }
+
+    /// Model of what the state machine's `current()` should be for a log of
+    /// `Push`/`Undo` entries, written independently of `StateMachine::replay`:
+    /// an entry is active unless some still-active `Undo` targets it, and the
+    /// surviving pushes apply in log order.
+    fn expected_state(entries: &[(TransitionId, PushKind)]) -> String {
+        let mut active = vec![false; entries.len()];
+        // Back to front: an `Undo` can only target an earlier entry, so
+        // whether entry `index` survives depends only on already-decided ones.
+        for index in (0..entries.len()).rev() {
+            let target_id = entries[index].0;
+            active[index] = !entries
+                .iter()
+                .enumerate()
+                .skip(index + 1)
+                .any(|(i, (_, kind))| {
+                    active[i] && matches!(kind, PushKind::Undo(target) if *target == target_id)
+                });
+        }
+
+        entries
+            .iter()
+            .zip(&active)
+            .filter_map(|((_, kind), active)| match kind {
+                PushKind::Push(c) if *active => Some(*c),
+                PushKind::Push(_) | PushKind::Undo(_) => None,
+            })
+            .collect()
     }
 }
