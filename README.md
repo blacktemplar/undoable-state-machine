@@ -56,3 +56,22 @@ let restored = StateMachine::<i64, Box<dyn Transition<i64>>>::build(persisted)?;
 assert_eq!(*restored.current(), 3);
 # Ok::<(), StateMachineError>(())
 ```
+
+## Serialization
+
+The `serde` feature implements `Serialize`/`Deserialize` for `TransitionId`, `LogEntry`,
+`LogEntryKind` and `StateMachine`:
+
+```toml
+[dependencies]
+undoable-state-machine = { version = "0.1", features = ["serde"] }
+```
+
+A whole log persists, undo entries included, so a restored state machine can still undo (and
+undo its undos). A `StateMachine` serializes as its log alone - `current()` is derived state and
+is recomputed by `build` on deserialization, which is also where a log that doesn't replay
+cleanly is rejected. See the `Serialize for StateMachine` impl for a full example.
+
+The log types are (de)serializable exactly when the transition type `T` is, which
+`Box<dyn Transition<S>>` isn't: use an enum of the transitions, or a crate like
+[`typetag`](https://docs.rs/typetag), as `T` for a persistable log.

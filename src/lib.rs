@@ -6,6 +6,8 @@ use std::{
     fmt,
 };
 
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 /// Identifies a single [`LogEntry`] so a later entry can target it via [`LogEntryKind::Undo`].
@@ -13,6 +15,7 @@ use uuid::Uuid;
 /// Caller-assigned via [`TransitionId::new`]. Must be unique across a single [`StateMachine`]'s
 /// log.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TransitionId(Uuid);
 
 impl Default for TransitionId {
@@ -93,7 +96,13 @@ impl<S, T: ?Sized + Transition<S>> Transition<S> for Box<T> {
 }
 
 /// One entry in a [`StateMachine`]'s append-only log.
+///
+/// With the `serde` feature, an entry is (de)serializable whenever the transition type `T` is, so
+/// a whole log (`Vec<LogEntry<T>>`), including its undo entries, can be persisted. Note that
+/// `Box<dyn Transition<S>>` is not (de)serializable - use an enum of the transitions, or a crate
+/// like [`typetag`](https://docs.rs/typetag), as `T` if you need to persist a log.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct LogEntry<T> {
     id: TransitionId,
     kind: LogEntryKind<T>,
@@ -134,6 +143,7 @@ impl<T> LogEntry<T> {
 /// Undo is just another log entry, which is what makes undo itself undoable. Undoing an `Undo`
 /// reactivates its target, which is basically a redo.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum LogEntryKind<T> {
     /// Applies the given transition.
     Apply(T),
@@ -463,6 +473,87 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
         }
 
         Ok(state)
+    }
+}
+
+/// Serializes the state machine as its log alone, the full append-only log including entries that
+/// have since been undone. [`StateMachine::current`] is derived state and is recomputed when
+/// deserializing, so it is not part of the serialized form.
+///
+/// # Examples
+///
+/// ```
+/// use serde::{Deserialize, Serialize};
+/// use undoable_state_machine::{
+///     LogEntry, LogEntryKind, StateMachine, Transition, TransitionError, TransitionId,
+/// };
+///
+/// // `T` has to be (de)serializable itself, so enumerate the transitions instead of using
+/// // `Box<dyn Transition<i64>>`.
+/// #[derive(Serialize, Deserialize)]
+/// enum Arith {
+///     Add(i64),
+///     Mul(i64),
+/// }
+///
+/// impl Transition<i64> for Arith {
+///     fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+///         Ok(())
+///     }
+///
+///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+///         match self {
+///             Arith::Add(v) => *state += v,
+///             Arith::Mul(v) => *state *= v,
+///         }
+///         Ok(())
+///     }
+/// }
+///
+/// let mut sm = StateMachine::<i64, Arith>::new();
+/// sm.apply(LogEntry::new(
+///     TransitionId::new(),
+///     LogEntryKind::Apply(Arith::Add(5)),
+/// ))?;
+/// let doubling_id = TransitionId::new();
+/// sm.apply(LogEntry::new(
+///     doubling_id,
+///     LogEntryKind::Apply(Arith::Mul(2)),
+/// ))?;
+/// let undo_id = TransitionId::new();
+/// sm.apply(LogEntry::new(undo_id, LogEntryKind::Undo(doubling_id)))?;
+/// assert_eq!(*sm.current(), 5);
+///
+/// let json = serde_json::to_string(&sm)?;
+/// let mut restored: StateMachine<i64, Arith> = serde_json::from_str(&json)?;
+/// assert_eq!(*restored.current(), 5);
+///
+/// // The undo entry round trips too, so it can still be undone itself.
+/// restored.apply(LogEntry::new(
+///     TransitionId::new(),
+///     LogEntryKind::Undo(undo_id),
+/// ))?;
+/// assert_eq!(*restored.current(), 10);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[cfg(feature = "serde")]
+impl<S, T: Serialize> Serialize for StateMachine<S, T> {
+    fn serialize<Ser: Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
+        self.log.serialize(serializer)
+    }
+}
+
+/// Deserializes a log and reconstructs the state machine from it with [`StateMachine::build`],
+/// which recomputes [`StateMachine::current`].
+///
+/// Deserializing therefore fails - with the [`StateMachineError`] as the message - on a log that
+/// `build` would reject: a duplicate entry id, an undo of an unknown target, or an active
+/// transition that doesn't replay cleanly.
+#[cfg(feature = "serde")]
+impl<'de, S: Default, T: Transition<S> + Deserialize<'de>> Deserialize<'de> for StateMachine<S, T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let log = Vec::<LogEntry<T>>::deserialize(deserializer)?;
+        Self::build(log).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1125,5 +1216,102 @@ mod tests {
                 PushKind::Push(_) | PushKind::Undo(_) => None,
             })
             .collect()
+    }
+
+    #[cfg(feature = "serde")]
+    mod serde_support {
+        use super::*;
+
+        // A transition type that is itself (de)serializable, which `Box<dyn
+        // Transition<i64>>` can't be. `Mul` makes the log non-commutative, so
+        // a round trip that lost the log's order would be visible.
+        #[derive(Debug, Serialize, Deserialize)]
+        enum Arith {
+            Add(i64),
+            Mul(i64),
+        }
+
+        impl Transition<i64> for Arith {
+            fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+                Ok(())
+            }
+
+            fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+                match self {
+                    Arith::Add(v) => *state += v,
+                    Arith::Mul(v) => *state *= v,
+                }
+                Ok(())
+            }
+        }
+
+        #[test]
+        fn a_log_round_trips_through_json() {
+            let add = LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Arith::Add(5)));
+            let mul = LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Arith::Mul(3)));
+            let log = vec![add, mul];
+
+            let json = serde_json::to_string(&log).unwrap();
+            let restored: Vec<LogEntry<Arith>> = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(restored.len(), 2);
+            assert_eq!(restored[0].id(), log[0].id());
+            assert_eq!(restored[1].id(), log[1].id());
+            // (5 + 0) * 3, not 0 * 3 + 5: the entries keep their order.
+            assert_eq!(*StateMachine::build(restored).unwrap().current(), 15);
+        }
+
+        #[test]
+        fn a_state_machine_round_trips_through_json_with_its_undos() {
+            let mut sm = StateMachine::<i64, Arith>::new();
+            sm.apply(LogEntry::new(
+                TransitionId::new(),
+                LogEntryKind::Apply(Arith::Add(5)),
+            ))
+            .unwrap();
+            let doubling_id = TransitionId::new();
+            sm.apply(LogEntry::new(
+                doubling_id,
+                LogEntryKind::Apply(Arith::Mul(2)),
+            ))
+            .unwrap();
+            let undo_id = TransitionId::new();
+            sm.apply(LogEntry::new(undo_id, LogEntryKind::Undo(doubling_id)))
+                .unwrap();
+            assert_eq!(*sm.current(), 5);
+
+            let json = serde_json::to_string(&sm).unwrap();
+            let mut restored: StateMachine<i64, Arith> = serde_json::from_str(&json).unwrap();
+
+            // `current` is recomputed from the restored log, undone entry included.
+            assert_eq!(*restored.current(), 5);
+            assert_eq!(restored.log().len(), 3);
+
+            // The undo entry survived as an entry, so it is still undoable.
+            restored
+                .apply(LogEntry::new(
+                    TransitionId::new(),
+                    LogEntryKind::Undo(undo_id),
+                ))
+                .unwrap();
+            assert_eq!(*restored.current(), 10);
+        }
+
+        #[test]
+        fn deserializing_a_state_machine_rejects_a_log_that_build_rejects() {
+            let unknown_id = TransitionId::new();
+            let log: Vec<LogEntry<Arith>> = vec![LogEntry::new(
+                TransitionId::new(),
+                LogEntryKind::Undo(unknown_id),
+            )];
+            let json = serde_json::to_string(&log).unwrap();
+
+            let err = serde_json::from_str::<StateMachine<i64, Arith>>(&json).unwrap_err();
+
+            assert!(
+                err.to_string().contains("undo targets unknown transition"),
+                "unexpected error: {err}"
+            );
+        }
     }
 }

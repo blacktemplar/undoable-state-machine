@@ -17,8 +17,10 @@ jobs:
         with:
           components: clippy
       - run: cargo test --workspace
+      - run: cargo test --workspace --all-features
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo doc --workspace --no-deps
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo doc --workspace --no-deps --all-features
 
   fmt:
     runs-on: ubuntu-latest
