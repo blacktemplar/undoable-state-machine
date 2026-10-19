@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entries included) can be persisted and restored. A `StateMachine`
   serializes as its log and is rebuilt through `StateMachine::build` on
   deserialization.
+- `StateMachine::rev_in_effect`: the log entries that are in effect, i.e.
+  not cancelled by an undo in effect, lazily from the newest to the oldest.
 
 ### Fixed
 

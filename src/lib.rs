@@ -1,10 +1,6 @@
 #![doc = include_str!("../README.md")]
 
-use std::{
-    collections::{HashMap, HashSet},
-    error::Error,
-    fmt,
-};
+use std::{collections::HashSet, error::Error, fmt};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -223,6 +219,71 @@ impl<S, T> StateMachine<S, T> {
     pub fn log(&self) -> &[LogEntry<T>] {
         &self.log
     }
+
+    /// Returns the log entries that are in effect, i.e. not cancelled by a later
+    /// [`LogEntryKind::Undo`] that is in effect itself, from the newest to the oldest.
+    ///
+    /// The iterator is lazy: it only walks the log as far back as it is advanced, so finding the
+    /// latest entry in effect that matches some condition costs only the part of the log that
+    /// lies after it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use undoable_state_machine::{
+    ///     LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition, TransitionError,
+    ///     TransitionId,
+    /// };
+    ///
+    /// struct Add(i64);
+    ///
+    /// impl Transition<i64> for Add {
+    ///     fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    ///         *state += self.0;
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let (add_5, add_7, undo_add_7) = (
+    ///     TransitionId::new(),
+    ///     TransitionId::new(),
+    ///     TransitionId::new(),
+    /// );
+    /// let log: Vec<LogEntry<Box<dyn Transition<i64>>>> = vec![
+    ///     LogEntry::new(add_5, LogEntryKind::Apply(Box::new(Add(5)))),
+    ///     LogEntry::new(add_7, LogEntryKind::Apply(Box::new(Add(7)))),
+    ///     LogEntry::new(undo_add_7, LogEntryKind::Undo(add_7)),
+    /// ];
+    /// let sm = StateMachine::build(log)?;
+    /// let in_effect: Vec<_> = sm.rev_in_effect().map(LogEntry::id).collect();
+    /// assert_eq!(in_effect, [undo_add_7, add_5]);
+    /// # Ok::<(), StateMachineError>(())
+    /// ```
+    pub fn rev_in_effect(&self) -> impl Iterator<Item = &LogEntry<T>> {
+        rev_log_with_status(&self.log).filter_map(|(entry, in_effect)| in_effect.then_some(entry))
+    }
+}
+
+/// Every entry of `log` from the newest to the oldest, each with whether it is in effect, i.e. not
+/// cancelled by a later [`LogEntryKind::Undo`] that is in effect itself.
+fn rev_log_with_status<T>(log: &[LogEntry<T>]) -> impl Iterator<Item = (&LogEntry<T>, bool)> {
+    // only a later entry can cancel an entry, so by the time the backward walk reaches an entry it
+    // has seen every undo in effect that could cancel it
+    let mut cancelled = HashSet::new();
+    log.iter().rev().map(move |entry| {
+        // ids are unique, so a cancelled id is never looked up again
+        let in_effect = !cancelled.remove(&entry.id);
+        if in_effect {
+            if let LogEntryKind::Undo(target) = entry.kind {
+                cancelled.insert(target);
+            }
+        }
+        (entry, in_effect)
+    })
 }
 
 impl<S: Default, T> StateMachine<S, T> {
@@ -433,25 +494,25 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// among the entries scanned, or [`StateMachineError::Transition`] if any active transition's
     /// [`Transition::check_applicable`] or [`Transition::apply`] fails.
     fn replay(entries: &[LogEntry<T>]) -> Result<S, StateMachineError> {
-        // the keys are the cancelled transition ids the values are if we found them later on
-        let mut cancelled = HashMap::new();
+        // the targets of the undos in effect that the backward walk hasn't reached yet; an entry
+        // that is not in effect is always such a target
+        let mut unresolved = HashSet::new();
         let mut active = Vec::with_capacity(entries.len());
-        for entry in entries.iter().rev() {
-            match cancelled.get_mut(&entry.id) {
-                Some(v) => *v = true,
-                None => match &entry.kind {
-                    LogEntryKind::Apply(_) => active.push(entry),
-                    LogEntryKind::Undo(transition_id) => {
-                        cancelled.insert(*transition_id, false);
-                    }
-                },
+        for (entry, in_effect) in rev_log_with_status(entries) {
+            if !in_effect {
+                unresolved.remove(&entry.id);
+                continue;
+            }
+            match &entry.kind {
+                LogEntryKind::Apply(_) => active.push(entry),
+                LogEntryKind::Undo(target) => {
+                    unresolved.insert(*target);
+                }
             }
         }
 
-        for (id, found) in cancelled {
-            if !found {
-                return Err(StateMachineError::UnknownTarget(id));
-            }
+        if let Some(id) = unresolved.into_iter().next() {
+            return Err(StateMachineError::UnknownTarget(id));
         }
 
         // The scan above runs backwards (an `Undo` can only cancel an entry before it), so
@@ -1053,6 +1114,27 @@ mod tests {
         assert_eq!(*sm.current(), 5);
     }
 
+    #[test]
+    fn rev_in_effect_skips_an_undone_undo_but_not_its_target() {
+        let a = apply_entry(5);
+        let a_id = a.id;
+        let undo_a = LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Undo(a_id),
+        };
+        let undo_a_id = undo_a.id;
+        let undo_undo_a = LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Undo(undo_a_id),
+        };
+        let undo_undo_a_id = undo_undo_a.id;
+
+        let sm = StateMachine::build(vec![a, undo_a, undo_undo_a]).unwrap();
+
+        let in_effect: Vec<_> = sm.rev_in_effect().map(LogEntry::id).collect();
+        assert_eq!(in_effect, [undo_undo_a_id, a_id]);
+    }
+
     /// What a random `apply` call in the property test below does: either
     /// append a new `Add`, or undo a previously-appended entry (picked by
     /// index into `all_ids`, wrapped so every index is valid).
@@ -1170,6 +1252,14 @@ mod tests {
                 mirror.push((id, kind));
 
                 proptest::prop_assert_eq!(sm.current(), &expected_state(&mirror));
+                let in_effect: Vec<_> = sm.rev_in_effect().map(LogEntry::id).collect();
+                let expected: Vec<_> = mirror
+                    .iter()
+                    .zip(expected_active(&mirror))
+                    .rev()
+                    .filter_map(|((id, _), active)| active.then_some(*id))
+                    .collect();
+                proptest::prop_assert_eq!(in_effect, expected);
             }
         }
     }
@@ -1194,6 +1284,19 @@ mod tests {
     /// an entry is active unless some still-active `Undo` targets it, and the
     /// surviving pushes apply in log order.
     fn expected_state(entries: &[(TransitionId, PushKind)]) -> String {
+        entries
+            .iter()
+            .zip(expected_active(entries))
+            .filter_map(|((_, kind), active)| match kind {
+                PushKind::Push(c) if active => Some(*c),
+                PushKind::Push(_) | PushKind::Undo(_) => None,
+            })
+            .collect()
+    }
+
+    /// Whether each of `entries` is active, i.e. not targeted by a still-active `Undo`, written
+    /// independently of `rev_log_with_status`.
+    fn expected_active(entries: &[(TransitionId, PushKind)]) -> Vec<bool> {
         let mut active = vec![false; entries.len()];
         // Back to front: an `Undo` can only target an earlier entry, so
         // whether entry `index` survives depends only on already-decided ones.
@@ -1207,15 +1310,7 @@ mod tests {
                     active[i] && matches!(kind, PushKind::Undo(target) if *target == target_id)
                 });
         }
-
-        entries
-            .iter()
-            .zip(&active)
-            .filter_map(|((_, kind), active)| match kind {
-                PushKind::Push(c) if *active => Some(*c),
-                PushKind::Push(_) | PushKind::Undo(_) => None,
-            })
-            .collect()
+        active
     }
 
     #[cfg(feature = "serde")]
