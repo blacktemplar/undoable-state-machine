@@ -1,6 +1,10 @@
 #![doc = include_str!("../README.md")]
 
-use std::{collections::HashSet, error::Error, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt,
+};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -186,14 +190,15 @@ impl Error for StateMachineError {
 
 pub struct StateMachine<S, T> {
     log: Vec<LogEntry<T>>,
-    /// Every id currently in `log`, kept in sync with it so id lookups (duplicate rejection,
-    /// `Undo` target existence) are O(1) instead of a linear scan over a potentially long log.
-    known_ids: HashSet<TransitionId>,
+    /// The index in `log` of every id currently in it, kept in sync with it so id lookups
+    /// (duplicate rejection, [`StateMachine::entry`]) are O(1) instead of a linear scan over a
+    /// potentially long log.
+    index_of: HashMap<TransitionId, usize>,
     current: S,
 }
 
 impl<S: fmt::Debug, T: fmt::Debug> fmt::Debug for StateMachine<S, T> {
-    // Omits the internal `known_ids` id cache, which is redundant with `log`.
+    // Omits the internal `index_of` id cache, which is redundant with `log`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StateMachine")
             .field("log", &self.log)
@@ -218,6 +223,47 @@ impl<S, T> StateMachine<S, T> {
     /// Returns the full append-only log, including entries that have since been undone.
     pub fn log(&self) -> &[LogEntry<T>] {
         &self.log
+    }
+
+    /// Returns the entry of the log with the id `id`, whether or not it is in effect, or `None` if
+    /// the log has no such entry. Takes constant time.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use undoable_state_machine::{
+    ///     LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition, TransitionError,
+    ///     TransitionId,
+    /// };
+    ///
+    /// struct Add(i64);
+    ///
+    /// impl Transition<i64> for Add {
+    ///     fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    ///         *state += self.0;
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let mut sm = StateMachine::<i64, Box<dyn Transition<i64>>>::new();
+    /// let (add_5, undo_add_5) = (TransitionId::new(), TransitionId::new());
+    /// sm.apply(LogEntry::new(add_5, LogEntryKind::Apply(Box::new(Add(5)))))?;
+    /// sm.apply(LogEntry::new(undo_add_5, LogEntryKind::Undo(add_5)))?;
+    ///
+    /// // the undone entry is still found
+    /// assert!(matches!(
+    ///     sm.entry(add_5).map(LogEntry::kind),
+    ///     Some(LogEntryKind::Apply(_))
+    /// ));
+    /// assert!(sm.entry(TransitionId::new()).is_none());
+    /// # Ok::<(), StateMachineError>(())
+    /// ```
+    pub fn entry(&self, id: TransitionId) -> Option<&LogEntry<T>> {
+        self.index_of.get(&id).map(|&index| &self.log[index])
     }
 
     /// Returns the log entries that are in effect, i.e. not cancelled by a later
@@ -305,7 +351,7 @@ impl<S: Default, T> StateMachine<S, T> {
     pub fn new() -> Self {
         Self {
             log: Vec::default(),
-            known_ids: HashSet::default(),
+            index_of: HashMap::default(),
             current: Default::default(),
         }
     }
@@ -358,16 +404,16 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// undo target, or an active transition that fails to apply. Also returns
     /// [`StateMachineError::DuplicateId`] if two entries in `log` share the same id.
     pub fn build(log: Vec<LogEntry<T>>) -> Result<Self, StateMachineError> {
-        let mut known_ids = HashSet::with_capacity(log.len());
-        for entry in &log {
-            if !known_ids.insert(entry.id) {
+        let mut index_of = HashMap::with_capacity(log.len());
+        for (index, entry) in log.iter().enumerate() {
+            if index_of.insert(entry.id, index).is_some() {
                 return Err(StateMachineError::DuplicateId(entry.id));
             }
         }
         let current = Self::replay(&log)?;
         Ok(Self {
             log,
-            known_ids,
+            index_of,
             current,
         })
     }
@@ -442,14 +488,14 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// determinism contract) itself fails to replay. This indicates a `Transition` impl that
     /// violates that contract, not a reachable failure under a correct one.
     pub fn apply(&mut self, entry: LogEntry<T>) -> Result<(), StateMachineError> {
-        if self.known_ids.contains(&entry.id) {
+        if self.index_of.contains_key(&entry.id) {
             return Err(StateMachineError::DuplicateId(entry.id));
         }
         match &entry.kind {
             LogEntryKind::Apply(transition) => match transition.check_applicable(&self.current) {
                 Ok(()) => match transition.apply(&mut self.current) {
                     Ok(()) => {
-                        self.known_ids.insert(entry.id);
+                        self.index_of.insert(entry.id, self.log.len());
                         self.log.push(entry);
                         Ok(())
                     }
@@ -468,7 +514,7 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
             LogEntryKind::Undo(_) => {
                 let id = entry.id;
                 // the duplicate check above makes this insert always succeed
-                self.known_ids.insert(id);
+                self.index_of.insert(id, self.log.len());
                 self.log.push(entry);
                 match Self::replay(&self.log) {
                     Ok(state) => {
@@ -477,7 +523,7 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
                     }
                     Err(err) => {
                         self.log.pop();
-                        self.known_ids.remove(&id);
+                        self.index_of.remove(&id);
                         Err(err)
                     }
                 }
@@ -909,9 +955,10 @@ mod tests {
         let guard_id = guard.id;
         sm.apply(guard).unwrap();
 
+        let undo_id = TransitionId::new();
         let err = sm
             .apply(LogEntry {
-                id: TransitionId::new(),
+                id: undo_id,
                 kind: LogEntryKind::Undo(add_id),
             })
             .unwrap_err();
@@ -925,6 +972,7 @@ mod tests {
         // The undo itself is rejected: current and the log are unaffected.
         assert_eq!(*sm.current(), 10);
         assert_eq!(sm.log().len(), 2);
+        assert!(sm.entry(undo_id).is_none());
     }
 
     #[test]
@@ -1210,6 +1258,10 @@ mod tests {
                 if sm.apply(LogEntry { id, kind }).is_ok() {
                     mirror.push((id, mirror_kind));
                     all_ids.push(id);
+                }
+                for (index, id) in all_ids.iter().enumerate() {
+                    let entry = sm.entry(*id).map(|entry| entry as *const _);
+                    proptest::prop_assert_eq!(entry, Some(&sm.log()[index] as *const _));
                 }
 
                 let rebuilt_log: Vec<LogEntry<I64Transition>> = mirror

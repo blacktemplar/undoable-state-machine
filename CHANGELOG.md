@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deserialization.
 - `StateMachine::rev_in_effect`: the log entries that are in effect, i.e.
   not cancelled by an undo in effect, lazily from the newest to the oldest.
+- `StateMachine::entry`: the log entry with a given id, in constant time.
 
 ### Fixed
 
