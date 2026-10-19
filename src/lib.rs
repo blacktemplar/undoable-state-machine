@@ -465,11 +465,10 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
                 },
                 Err(err) => Err(StateMachineError::Transition(entry.id, err)),
             },
-            LogEntryKind::Undo(target) => {
+            LogEntryKind::Undo(_) => {
                 let id = entry.id;
-                if !self.known_ids.insert(id) {
-                    return Err(StateMachineError::UnknownTarget(*target));
-                }
+                // the duplicate check above makes this insert always succeed
+                self.known_ids.insert(id);
                 self.log.push(entry);
                 match Self::replay(&self.log) {
                     Ok(state) => {
@@ -978,6 +977,29 @@ mod tests {
         let dup: LogEntry<I64Transition> = LogEntry {
             id,
             kind: LogEntryKind::Apply(Box::new(Add(3))),
+        };
+        let err = sm.apply(dup).unwrap_err();
+
+        match err {
+            StateMachineError::DuplicateId(dup_id) => assert_eq!(dup_id, id),
+            StateMachineError::UnknownTarget(_) | StateMachineError::Transition(_, _) => {
+                panic!("expected StateMachineError::DuplicateId")
+            }
+        }
+        assert_eq!(*sm.current(), 5);
+        assert_eq!(sm.log().len(), 1);
+    }
+
+    #[test]
+    fn apply_rejects_an_undo_with_a_duplicate_id() {
+        let mut sm = StateMachine::<i64, I64Transition>::default();
+        let entry = apply_entry(5);
+        let id = entry.id;
+        sm.apply(entry).unwrap();
+
+        let dup: LogEntry<I64Transition> = LogEntry {
+            id,
+            kind: LogEntryKind::Undo(id),
         };
         let err = sm.apply(dup).unwrap_err();
 
