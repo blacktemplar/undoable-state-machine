@@ -11,6 +11,10 @@ separate mechanism. Undoing a transition that isn't the most recent one is rejec
 still-active transition depends on it, so the state machine never silently replays into a broken
 state.
 
+A past transition can also be replaced with a different one by another log entry. The
+replacement runs at the position of the transition it replaces, and undoing it brings back the
+previous version.
+
 The crate has no notion of any particular domain: it is generic over the state type `S` and the
 transition type `T: Transition<S>`, and consumers supply their own.
 

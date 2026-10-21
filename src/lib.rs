@@ -119,7 +119,7 @@ impl<T> LogEntry<T> {
     /// let entry = LogEntry::new(TransitionId::new(), LogEntryKind::Apply(5));
     /// match entry.kind() {
     ///     LogEntryKind::Apply(v) => assert_eq!(*v, 5),
-    ///     LogEntryKind::Undo(_) => unreachable!(),
+    ///     LogEntryKind::Undo(_) | LogEntryKind::Replace { .. } => unreachable!(),
     /// }
     /// ```
     #[must_use]
@@ -127,18 +127,20 @@ impl<T> LogEntry<T> {
         Self { id, kind }
     }
 
-    /// Uniquely identifies this entry so a later entry can target it via [`LogEntryKind::Undo`].
+    /// Uniquely identifies this entry so a later entry can target it via [`LogEntryKind::Undo`] or
+    /// [`LogEntryKind::Replace`].
     pub fn id(&self) -> TransitionId {
         self.id
     }
 
-    /// What this entry does: apply a transition, or undo a previous entry.
+    /// What this entry does: apply a transition, undo a previous entry, or replace a previous
+    /// transition.
     pub fn kind(&self) -> &LogEntryKind<T> {
         &self.kind
     }
 }
 
-/// Represents applying a transition or undoing a previous transition.
+/// Represents applying a transition, undoing a previous entry, or replacing a previous transition.
 ///
 /// Undo is just another log entry, which is what makes undo itself undoable. Undoing an `Undo`
 /// reactivates its target, which is basically a redo.
@@ -147,8 +149,22 @@ impl<T> LogEntry<T> {
 pub enum LogEntryKind<T> {
     /// Applies the given transition.
     Apply(T),
-    /// Undoes the transition with the given id
+    /// Undoes the entry with the given id
     Undo(TransitionId),
+    /// Runs `with` in place of the [`LogEntryKind::Apply`] with the id `target`, at that entry's
+    /// position in the log rather than at the end.
+    ///
+    /// `target` is always the original `Apply`, never another `Replace`: replacing a transition
+    /// again is another `Replace` of the same `Apply`. The latest `Replace` of an `Apply` that is
+    /// in effect runs in its place, so undoing that `Replace` falls back to the previous one, or
+    /// to the original transition if there is none. Undoing the targeted `Apply` itself undoes it
+    /// together with all of its replacements.
+    Replace {
+        /// The id of the `Apply` entry whose transition is replaced.
+        target: TransitionId,
+        /// The transition that runs in place of the target's.
+        with: T,
+    },
 }
 
 /// An error from [`StateMachine::apply`] or [`StateMachine::build`].
@@ -156,11 +172,17 @@ pub enum LogEntryKind<T> {
 pub enum StateMachineError {
     /// A transition returned an error
     Transition(TransitionId, TransitionError),
-    /// An `Undo` targeted an id not present anywhere earlier in the log.
+    /// An `Undo` or `Replace` targeted an id not present anywhere earlier in the log.
     UnknownTarget(TransitionId),
     /// An entry's id already appears earlier in the log. [`TransitionId`] must be unique, reusing
-    /// one would make `Undo` targets ambiguous.
+    /// one would make `Undo` and `Replace` targets ambiguous.
     DuplicateId(TransitionId),
+    /// A `Replace` targeted an entry with the given id that is not an `Apply`, e.g. another
+    /// `Replace` instead of the `Apply` that one replaces.
+    ReplaceTargetNotApply(TransitionId),
+    /// [`StateMachine::apply`] got a `Replace` whose target, the entry with the given id, is not in
+    /// effect, i.e. undone.
+    ReplaceTargetNotInEffect(TransitionId),
 }
 
 impl fmt::Display for StateMachineError {
@@ -170,10 +192,16 @@ impl fmt::Display for StateMachineError {
                 write!(f, "transition {id:?} failed: {err}")
             }
             StateMachineError::UnknownTarget(id) => {
-                write!(f, "undo targets unknown transition {id:?}")
+                write!(f, "log entry targets unknown transition {id:?}")
             }
             StateMachineError::DuplicateId(id) => {
                 write!(f, "transition id {id:?} already appears in the log")
+            }
+            StateMachineError::ReplaceTargetNotApply(id) => {
+                write!(f, "replace targets {id:?}, which is not an apply entry")
+            }
+            StateMachineError::ReplaceTargetNotInEffect(id) => {
+                write!(f, "replace targets {id:?}, which is not in effect")
             }
         }
     }
@@ -183,7 +211,10 @@ impl Error for StateMachineError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             StateMachineError::Transition(_, err) => Some(err.as_ref()),
-            StateMachineError::UnknownTarget(_) | StateMachineError::DuplicateId(_) => None,
+            StateMachineError::UnknownTarget(_)
+            | StateMachineError::DuplicateId(_)
+            | StateMachineError::ReplaceTargetNotApply(_)
+            | StateMachineError::ReplaceTargetNotInEffect(_) => None,
         }
     }
 }
@@ -266,8 +297,76 @@ impl<S, T> StateMachine<S, T> {
         self.index_of.get(&id).map(|&index| &self.log[index])
     }
 
+    /// Returns the transition that runs in place of the [`LogEntryKind::Apply`] with the id `id`:
+    /// the one of the latest [`LogEntryKind::Replace`] of it that is in effect, or the `Apply`'s
+    /// own transition if there is none. Returns `None` if the log has no `Apply` with this id.
+    ///
+    /// Doesn't take into account whether the `Apply` itself is in effect, so for an undone `Apply`
+    /// this is the transition that would run if it was redone.
+    ///
+    /// Only walks the part of the log after the `Apply`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use undoable_state_machine::{
+    ///     LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition, TransitionError,
+    ///     TransitionId,
+    /// };
+    ///
+    /// #[derive(Debug, PartialEq)]
+    /// struct Add(i64);
+    ///
+    /// impl Transition<i64> for Add {
+    ///     fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    ///         *state += self.0;
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let mut sm = StateMachine::<i64, Add>::new();
+    /// let (add, replace) = (TransitionId::new(), TransitionId::new());
+    /// sm.apply(LogEntry::new(add, LogEntryKind::Apply(Add(5))))?;
+    /// assert_eq!(sm.effective_transition(add), Some(&Add(5)));
+    ///
+    /// sm.apply(LogEntry::new(
+    ///     replace,
+    ///     LogEntryKind::Replace {
+    ///         target: add,
+    ///         with: Add(7),
+    ///     },
+    /// ))?;
+    /// assert_eq!(sm.effective_transition(add), Some(&Add(7)));
+    /// // only an `Apply` has an effective transition
+    /// assert_eq!(sm.effective_transition(replace), None);
+    /// # Ok::<(), StateMachineError>(())
+    /// ```
+    pub fn effective_transition(&self, id: TransitionId) -> Option<&T> {
+        let &index = self.index_of.get(&id)?;
+        let LogEntryKind::Apply(original) = &self.log[index].kind else {
+            return None;
+        };
+        // only a later entry can replace the `Apply`, and its status only depends on the entries
+        // after it, so the part of the log after the `Apply` is enough
+        let mut later = rev_log_with_status(&self.log[index + 1..]);
+        let replacement = later.find_map(|(entry, in_effect)| match &entry.kind {
+            LogEntryKind::Replace { target, with } if in_effect && *target == id => Some(with),
+            _ => None,
+        });
+        Some(replacement.unwrap_or(original))
+    }
+
     /// Returns the log entries that are in effect, i.e. not cancelled by a later
     /// [`LogEntryKind::Undo`] that is in effect itself, from the newest to the oldest.
+    ///
+    /// Replacing doesn't cancel anything: a [`LogEntryKind::Replace`] that is in effect leaves its
+    /// target and earlier replacements of it in effect, even though only its own transition runs.
+    /// A `Replace` of an undone `Apply` is in effect as well, although it has no effect until the
+    /// `Apply` is redone.
     ///
     /// The iterator is lazy: it only walks the log as far back as it is advanced, so finding the
     /// latest entry in effect that matches some condition costs only the part of the log that
@@ -330,6 +429,25 @@ fn rev_log_with_status<T>(log: &[LogEntry<T>]) -> impl Iterator<Item = (&LogEntr
         }
         (entry, in_effect)
     })
+}
+
+/// Checks that `target`, the target of a [`LogEntryKind::Replace`] at index `replace_index` of
+/// `log`, is an [`LogEntryKind::Apply`] before it. Returns `target`'s index on success.
+fn check_replace_target<T>(
+    log: &[LogEntry<T>],
+    index_of: &HashMap<TransitionId, usize>,
+    target: TransitionId,
+    replace_index: usize,
+) -> Result<usize, StateMachineError> {
+    match index_of.get(&target) {
+        Some(&index) if index < replace_index => match log[index].kind {
+            LogEntryKind::Apply(_) => Ok(index),
+            LogEntryKind::Undo(_) | LogEntryKind::Replace { .. } => {
+                Err(StateMachineError::ReplaceTargetNotApply(target))
+            }
+        },
+        _ => Err(StateMachineError::UnknownTarget(target)),
+    }
 }
 
 impl<S: Default, T> StateMachine<S, T> {
@@ -400,14 +518,24 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     ///
     /// # Errors
     ///
-    /// Returns an error under the same conditions as [`Self::apply`]'s `Undo` case: an unknown
-    /// undo target, or an active transition that fails to apply. Also returns
-    /// [`StateMachineError::DuplicateId`] if two entries in `log` share the same id.
+    /// Returns an error under the same conditions as [`Self::apply`]'s `Undo` and `Replace` cases:
+    /// an unknown undo or replace target, a replace target that is not an `Apply`, or an active
+    /// transition that fails to apply. Also returns [`StateMachineError::DuplicateId`] if two
+    /// entries in `log` share the same id.
+    ///
+    /// Unlike [`Self::apply`], accepts a `Replace` whose target is undone at that point of the log,
+    /// e.g. in a log merged from multiple sources. Such a `Replace` has no effect until its target
+    /// is redone.
     pub fn build(log: Vec<LogEntry<T>>) -> Result<Self, StateMachineError> {
         let mut index_of = HashMap::with_capacity(log.len());
         for (index, entry) in log.iter().enumerate() {
             if index_of.insert(entry.id, index).is_some() {
                 return Err(StateMachineError::DuplicateId(entry.id));
+            }
+        }
+        for (index, entry) in log.iter().enumerate() {
+            if let LogEntryKind::Replace { target, .. } = entry.kind {
+                check_replace_target(&log, &index_of, target, index)?;
             }
         }
         let current = Self::replay(&log)?;
@@ -476,10 +604,13 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     ///
     /// # Errors
     ///
-    /// Returns [`StateMachineError::Transition`] if the transition (for `Apply`) or some later
-    /// active entry that depended on the target (for `Undo`) fails;
-    /// [`StateMachineError::UnknownTarget`] if `Undo` targets an id not present earlier in the
-    /// log. Returns [`StateMachineError::DuplicateId`] if `entry`'s id already appears in the
+    /// Returns [`StateMachineError::Transition`] if the transition (for `Apply`), the replacing
+    /// transition (for `Replace`) or some later active entry that depended on the target (for
+    /// `Undo` and `Replace`) fails; [`StateMachineError::UnknownTarget`] if `Undo` or `Replace`
+    /// targets an id not present earlier in the log. Returns
+    /// [`StateMachineError::ReplaceTargetNotApply`] if `Replace` targets an entry that is not an
+    /// `Apply`, and [`StateMachineError::ReplaceTargetNotInEffect`] if it targets an undone
+    /// `Apply`. Returns [`StateMachineError::DuplicateId`] if `entry`'s id already appears in the
     /// log.
     ///
     /// # Panics
@@ -511,7 +642,19 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
                 },
                 Err(err) => Err(StateMachineError::Transition(entry.id, err)),
             },
-            LogEntryKind::Undo(_) => {
+            LogEntryKind::Undo(_) | LogEntryKind::Replace { .. } => {
+                if let LogEntryKind::Replace { target, .. } = entry.kind {
+                    let index =
+                        check_replace_target(&self.log, &self.index_of, target, self.log.len())?;
+                    // the walk ends at the target, whose status only depends on the entries
+                    // after it
+                    let in_effect = rev_log_with_status(&self.log[index..])
+                        .last()
+                        .is_some_and(|(_, in_effect)| in_effect);
+                    if !in_effect {
+                        return Err(StateMachineError::ReplaceTargetNotInEffect(target));
+                    }
+                }
                 let id = entry.id;
                 // the duplicate check above makes this insert always succeed
                 self.index_of.insert(id, self.log.len());
@@ -531,27 +674,42 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
         }
     }
 
-    /// Replays every active log entry, in log order, onto a fresh `S::default()`.
+    /// Replays every active log entry, in log order, onto a fresh `S::default()`. An `Apply` that
+    /// has a `Replace` in effect runs the latest such replacement's transition instead of its own.
+    ///
+    /// Expects every `Replace` target to be an earlier `Apply` (see [`check_replace_target`]).
     ///
     /// # Errors
     ///
     /// Returns [`StateMachineError::UnknownTarget`] if an `Undo` targets an id that never appears
     /// among the entries scanned, or [`StateMachineError::Transition`] if any active transition's
-    /// [`Transition::check_applicable`] or [`Transition::apply`] fails.
+    /// [`Transition::check_applicable`] or [`Transition::apply`] fails. A failing replacement is
+    /// reported with the id of its `Replace`.
     fn replay(entries: &[LogEntry<T>]) -> Result<S, StateMachineError> {
         // the targets of the undos in effect that the backward walk hasn't reached yet; an entry
         // that is not in effect is always such a target
         let mut unresolved = HashSet::new();
+        // per replaced `Apply` the backward walk hasn't reached yet, the id and transition of the
+        // latest `Replace` of it in effect, i.e. the first one the walk met
+        let mut replacements = HashMap::new();
         let mut active = Vec::with_capacity(entries.len());
         for (entry, in_effect) in rev_log_with_status(entries) {
             if !in_effect {
                 unresolved.remove(&entry.id);
+                replacements.remove(&entry.id);
                 continue;
             }
             match &entry.kind {
-                LogEntryKind::Apply(_) => active.push(entry),
+                LogEntryKind::Apply(transition) => active.push(
+                    replacements
+                        .remove(&entry.id)
+                        .unwrap_or((entry.id, transition)),
+                ),
                 LogEntryKind::Undo(target) => {
                     unresolved.insert(*target);
+                }
+                LogEntryKind::Replace { target, with } => {
+                    replacements.entry(*target).or_insert((entry.id, with));
                 }
             }
         }
@@ -566,16 +724,13 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
         let active = active.into_iter().rev();
 
         let mut state = S::default();
-        for entry in active {
-            let LogEntryKind::Apply(transition) = &entry.kind else {
-                unreachable!("We only added apply kinds to active")
-            };
+        for (id, transition) in active {
             transition
                 .check_applicable(&state)
-                .map_err(|err| StateMachineError::Transition(entry.id, err))?;
+                .map_err(|err| StateMachineError::Transition(id, err))?;
             transition
                 .apply(&mut state)
-                .map_err(|err| StateMachineError::Transition(entry.id, err))?;
+                .map_err(|err| StateMachineError::Transition(id, err))?;
         }
 
         Ok(state)
@@ -859,9 +1014,7 @@ mod tests {
 
         match err {
             StateMachineError::Transition(id, _) => assert_eq!(id, failing_id),
-            StateMachineError::UnknownTarget(_) | StateMachineError::DuplicateId(_) => {
-                panic!("expected StateMachineError::Transition")
-            }
+            other => panic!("expected StateMachineError::Transition, got {other:?}"),
         }
         assert_eq!(*sm.current(), 5);
         assert_eq!(sm.log().len(), 1);
@@ -884,9 +1037,7 @@ mod tests {
                 assert_eq!(id, failing_id);
                 assert_eq!(err.to_string(), "boom");
             }
-            StateMachineError::UnknownTarget(_) | StateMachineError::DuplicateId(_) => {
-                panic!("expected StateMachineError::Transition")
-            }
+            other => panic!("expected StateMachineError::Transition, got {other:?}"),
         }
         // The failing entry is never recorded in the log. `current` was
         // already mutated by `apply` before it failed though, so per
@@ -965,9 +1116,7 @@ mod tests {
 
         match err {
             StateMachineError::Transition(id, _) => assert_eq!(id, guard_id),
-            StateMachineError::UnknownTarget(_) | StateMachineError::DuplicateId(_) => {
-                panic!("expected StateMachineError::Transition")
-            }
+            other => panic!("expected StateMachineError::Transition, got {other:?}"),
         }
         // The undo itself is rejected: current and the log are unaffected.
         assert_eq!(*sm.current(), 10);
@@ -1006,9 +1155,7 @@ mod tests {
 
         match err {
             StateMachineError::Transition(id, _) => assert_eq!(id, guard_id),
-            StateMachineError::UnknownTarget(_) | StateMachineError::DuplicateId(_) => {
-                panic!("expected StateMachineError::Transition")
-            }
+            other => panic!("expected StateMachineError::Transition, got {other:?}"),
         }
         // The undo itself is rejected: current and the log are unaffected.
         assert_eq!(*sm.current(), 11);
@@ -1030,9 +1177,7 @@ mod tests {
 
         match err {
             StateMachineError::DuplicateId(dup_id) => assert_eq!(dup_id, id),
-            StateMachineError::UnknownTarget(_) | StateMachineError::Transition(_, _) => {
-                panic!("expected StateMachineError::DuplicateId")
-            }
+            other => panic!("expected StateMachineError::DuplicateId, got {other:?}"),
         }
         assert_eq!(*sm.current(), 5);
         assert_eq!(sm.log().len(), 1);
@@ -1053,9 +1198,7 @@ mod tests {
 
         match err {
             StateMachineError::DuplicateId(dup_id) => assert_eq!(dup_id, id),
-            StateMachineError::UnknownTarget(_) | StateMachineError::Transition(_, _) => {
-                panic!("expected StateMachineError::DuplicateId")
-            }
+            other => panic!("expected StateMachineError::DuplicateId, got {other:?}"),
         }
         assert_eq!(*sm.current(), 5);
         assert_eq!(sm.log().len(), 1);
@@ -1205,18 +1348,292 @@ mod tests {
         assert_eq!(in_effect, [undo_undo_a_id, a_id]);
     }
 
+    fn undo_entry<T>(target: TransitionId) -> LogEntry<T> {
+        LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Undo(target),
+        }
+    }
+
+    fn replace_push_entry(target: TransitionId, c: char) -> LogEntry<StringTransition> {
+        LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Replace {
+                target,
+                with: Box::new(Push(c)),
+            },
+        }
+    }
+
+    /// Applies `entry` to `sm` and returns its id.
+    fn apply_get_id<S: Default, T: Transition<S>>(
+        sm: &mut StateMachine<S, T>,
+        entry: LogEntry<T>,
+    ) -> TransitionId {
+        let id = entry.id;
+        sm.apply(entry).unwrap();
+        id
+    }
+
+    #[test]
+    fn replace_runs_in_the_slot_of_its_target() {
+        let mut sm = StateMachine::<String, StringTransition>::default();
+        sm.apply(push_entry('a')).unwrap();
+        let x_id = apply_get_id(&mut sm, push_entry('x'));
+        sm.apply(push_entry('b')).unwrap();
+
+        sm.apply(replace_push_entry(x_id, 'y')).unwrap();
+
+        assert_eq!(sm.current(), "ayb");
+    }
+
+    #[test]
+    fn undoing_the_latest_replace_falls_back_to_the_previous_one() {
+        let mut sm = StateMachine::<String, StringTransition>::default();
+        sm.apply(push_entry('a')).unwrap();
+        let x_id = apply_get_id(&mut sm, push_entry('x'));
+        sm.apply(push_entry('b')).unwrap();
+        let y_id = apply_get_id(&mut sm, replace_push_entry(x_id, 'y'));
+        let z_id = apply_get_id(&mut sm, replace_push_entry(x_id, 'z'));
+        assert_eq!(sm.current(), "azb");
+
+        let undo_z_id = apply_get_id(&mut sm, undo_entry(z_id));
+        assert_eq!(sm.current(), "ayb");
+        sm.apply(undo_entry(y_id)).unwrap();
+        assert_eq!(sm.current(), "axb");
+        // redoing `z` brings it back on top of the (still undone) `y`
+        sm.apply(undo_entry(undo_z_id)).unwrap();
+        assert_eq!(sm.current(), "azb");
+    }
+
+    #[test]
+    fn undoing_a_shadowed_replace_changes_nothing_until_the_later_one_is_undone() {
+        let mut sm = StateMachine::<String, StringTransition>::default();
+        sm.apply(push_entry('a')).unwrap();
+        let x_id = apply_get_id(&mut sm, push_entry('x'));
+        let y_id = apply_get_id(&mut sm, replace_push_entry(x_id, 'y'));
+        let z_id = apply_get_id(&mut sm, replace_push_entry(x_id, 'z'));
+
+        sm.apply(undo_entry(y_id)).unwrap();
+        assert_eq!(sm.current(), "az");
+        sm.apply(undo_entry(z_id)).unwrap();
+        assert_eq!(sm.current(), "ax");
+    }
+
+    #[test]
+    fn undoing_the_target_undoes_it_with_its_replacements() {
+        let mut sm = StateMachine::<String, StringTransition>::default();
+        sm.apply(push_entry('a')).unwrap();
+        let x_id = apply_get_id(&mut sm, push_entry('x'));
+        sm.apply(replace_push_entry(x_id, 'y')).unwrap();
+
+        let undo_x_id = apply_get_id(&mut sm, undo_entry(x_id));
+        assert_eq!(sm.current(), "a");
+        // redoing `x` brings it back replaced
+        sm.apply(undo_entry(undo_x_id)).unwrap();
+        assert_eq!(sm.current(), "ay");
+    }
+
+    #[test]
+    fn replace_can_satisfy_a_later_entry_that_undoing_its_target_would_break() {
+        let mut sm = StateMachine::<i64, I64Transition>::default();
+        let add_id = apply_get_id(&mut sm, apply_entry(10));
+        sm.apply(LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Apply(Box::new(RequireAtLeast(10))),
+        })
+        .unwrap();
+
+        sm.apply(LogEntry {
+            id: TransitionId::new(),
+            kind: LogEntryKind::Replace {
+                target: add_id,
+                with: Box::new(Add(20)),
+            },
+        })
+        .unwrap();
+
+        assert_eq!(*sm.current(), 20);
+    }
+
+    #[test]
+    fn replace_that_breaks_a_later_entry_is_rejected_and_blames_that_entry() {
+        let mut sm = StateMachine::<i64, I64Transition>::default();
+        let add_id = apply_get_id(&mut sm, apply_entry(10));
+        let guard_id = apply_get_id(
+            &mut sm,
+            LogEntry {
+                id: TransitionId::new(),
+                kind: LogEntryKind::Apply(Box::new(RequireAtLeast(10))),
+            },
+        );
+
+        let replace_id = TransitionId::new();
+        let err = sm
+            .apply(LogEntry {
+                id: replace_id,
+                kind: LogEntryKind::Replace {
+                    target: add_id,
+                    with: Box::new(Add(1)),
+                },
+            })
+            .unwrap_err();
+
+        match err {
+            StateMachineError::Transition(id, _) => assert_eq!(id, guard_id),
+            other => panic!("expected StateMachineError::Transition, got {other:?}"),
+        }
+        assert_eq!(*sm.current(), 10);
+        assert_eq!(sm.log().len(), 2);
+        assert!(sm.entry(replace_id).is_none());
+    }
+
+    #[test]
+    fn a_failing_replacement_is_rejected_and_blames_the_replace() {
+        let mut sm = StateMachine::<i64, I64Transition>::default();
+        let add_id = apply_get_id(&mut sm, apply_entry(10));
+
+        let replace_id = TransitionId::new();
+        let err = sm
+            .apply(LogEntry {
+                id: replace_id,
+                kind: LogEntryKind::Replace {
+                    target: add_id,
+                    with: Box::new(FailDuringApply(1)),
+                },
+            })
+            .unwrap_err();
+
+        match err {
+            StateMachineError::Transition(id, err) => {
+                assert_eq!(id, replace_id);
+                assert_eq!(err.to_string(), "boom");
+            }
+            other => panic!("expected StateMachineError::Transition, got {other:?}"),
+        }
+        assert_eq!(*sm.current(), 10);
+        assert_eq!(sm.log().len(), 1);
+    }
+
+    #[test]
+    fn apply_rejects_a_replace_of_an_unknown_target() {
+        let mut sm = StateMachine::<String, StringTransition>::default();
+        sm.apply(push_entry('a')).unwrap();
+
+        let unknown_id = TransitionId::new();
+        match sm.apply(replace_push_entry(unknown_id, 'y')) {
+            Err(StateMachineError::UnknownTarget(id)) => assert_eq!(id, unknown_id),
+            other => panic!("expected StateMachineError::UnknownTarget, got {other:?}"),
+        }
+        assert_eq!(sm.log().len(), 1);
+    }
+
+    #[test]
+    fn apply_rejects_a_replace_of_a_non_apply() {
+        let mut sm = StateMachine::<String, StringTransition>::default();
+        let x_id = apply_get_id(&mut sm, push_entry('x'));
+        let replace_id = apply_get_id(&mut sm, replace_push_entry(x_id, 'y'));
+        let undo_id = apply_get_id(&mut sm, undo_entry(replace_id));
+
+        for target in [replace_id, undo_id] {
+            match sm.apply(replace_push_entry(target, 'z')) {
+                Err(StateMachineError::ReplaceTargetNotApply(id)) => assert_eq!(id, target),
+                other => panic!("expected StateMachineError::ReplaceTargetNotApply, got {other:?}"),
+            }
+        }
+        assert_eq!(sm.current(), "x");
+        assert_eq!(sm.log().len(), 3);
+    }
+
+    #[test]
+    fn apply_rejects_a_replace_of_an_undone_target() {
+        let mut sm = StateMachine::<String, StringTransition>::default();
+        sm.apply(push_entry('a')).unwrap();
+        let x_id = apply_get_id(&mut sm, push_entry('x'));
+        sm.apply(undo_entry(x_id)).unwrap();
+
+        match sm.apply(replace_push_entry(x_id, 'y')) {
+            Err(StateMachineError::ReplaceTargetNotInEffect(id)) => assert_eq!(id, x_id),
+            other => panic!("expected StateMachineError::ReplaceTargetNotInEffect, got {other:?}"),
+        }
+        assert_eq!(sm.current(), "a");
+        assert_eq!(sm.log().len(), 3);
+    }
+
+    #[test]
+    fn build_accepts_a_replace_of_an_undone_target_which_runs_once_redone() {
+        let a = push_entry('a');
+        let x = push_entry('x');
+        let x_id = x.id;
+        let undo_x = undo_entry(x_id);
+        let undo_x_id = undo_x.id;
+        let replace_x = replace_push_entry(x_id, 'y');
+        let replace_x_id = replace_x.id;
+
+        let mut sm = StateMachine::build(vec![a, x, undo_x, replace_x]).unwrap();
+        assert_eq!(sm.current(), "a");
+        // the dormant replace is in effect nonetheless
+        let in_effect: Vec<_> = sm.rev_in_effect().map(LogEntry::id).collect();
+        assert_eq!(in_effect[..2], [replace_x_id, undo_x_id]);
+
+        sm.apply(undo_entry(undo_x_id)).unwrap();
+        assert_eq!(sm.current(), "ay");
+    }
+
+    #[test]
+    fn build_rejects_a_replace_of_a_non_apply() {
+        let x = push_entry('x');
+        let replace_x = replace_push_entry(x.id, 'y');
+        let replace_id = replace_x.id;
+        let replace_replace = replace_push_entry(replace_id, 'z');
+
+        match StateMachine::build(vec![x, replace_x, replace_replace]) {
+            Err(StateMachineError::ReplaceTargetNotApply(id)) => assert_eq!(id, replace_id),
+            Ok(_) => panic!("expected build to fail"),
+            Err(other) => {
+                panic!("expected StateMachineError::ReplaceTargetNotApply, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn build_rejects_a_replace_appearing_before_its_target() {
+        let x = push_entry('x');
+        let x_id = x.id;
+        let replace_x = replace_push_entry(x_id, 'y');
+
+        match StateMachine::build(vec![replace_x, x]) {
+            Err(StateMachineError::UnknownTarget(id)) => assert_eq!(id, x_id),
+            Ok(_) => panic!("expected build to fail"),
+            Err(other) => panic!("expected StateMachineError::UnknownTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rev_in_effect_keeps_a_replaced_apply_and_its_shadowed_replacements() {
+        let mut sm = StateMachine::<String, StringTransition>::default();
+        let x_id = apply_get_id(&mut sm, push_entry('x'));
+        let y_id = apply_get_id(&mut sm, replace_push_entry(x_id, 'y'));
+        let z_id = apply_get_id(&mut sm, replace_push_entry(x_id, 'z'));
+
+        let in_effect: Vec<_> = sm.rev_in_effect().map(LogEntry::id).collect();
+        assert_eq!(in_effect, [z_id, y_id, x_id]);
+    }
+
     /// What a random `apply` call in the property test below does: either
-    /// append a new `Add`, or undo a previously-appended entry (picked by
-    /// index into `all_ids`, wrapped so every index is valid).
+    /// append a new `Add`, or undo or replace a previously-appended entry
+    /// (picked by index into `all_ids`, wrapped so every index is valid).
     #[derive(Clone, Debug)]
     enum RandomOp {
         Apply(i64),
         Undo(usize),
+        Replace(usize, i64),
     }
 
     enum MirrorKind {
         Apply(i64),
         Undo(TransitionId),
+        Replace(TransitionId, i64),
     }
 
     proptest::proptest! {
@@ -1231,6 +1648,8 @@ mod tests {
                 proptest::prop_oneof![
                     (-1_000_000i64..1_000_000i64).prop_map(RandomOp::Apply),
                     proptest::prelude::any::<usize>().prop_map(RandomOp::Undo),
+                    (proptest::prelude::any::<usize>(), -1_000_000i64..1_000_000i64)
+                        .prop_map(|(idx, v)| RandomOp::Replace(idx, v)),
                 ],
                 0..50,
             )
@@ -1253,6 +1672,20 @@ mod tests {
                         let target = all_ids[idx % all_ids.len()];
                         (LogEntryKind::Undo(target), MirrorKind::Undo(target))
                     }
+                    // may target a non-`Apply` or an undone entry, then `apply` rejects it
+                    RandomOp::Replace(idx, v) => {
+                        if all_ids.is_empty() {
+                            continue;
+                        }
+                        let target = all_ids[idx % all_ids.len()];
+                        (
+                            LogEntryKind::Replace {
+                                target,
+                                with: Box::new(Add(v)) as I64Transition,
+                            },
+                            MirrorKind::Replace(target, v),
+                        )
+                    }
                 };
 
                 if sm.apply(LogEntry { id, kind }).is_ok() {
@@ -1272,6 +1705,10 @@ mod tests {
                                 LogEntryKind::Apply(Box::new(Add(*v)) as I64Transition)
                             }
                             MirrorKind::Undo(target) => LogEntryKind::Undo(*target),
+                            MirrorKind::Replace(target, v) => LogEntryKind::Replace {
+                                target: *target,
+                                with: Box::new(Add(*v)) as I64Transition,
+                            },
                         };
                         LogEntry { id: *id, kind }
                     })
@@ -1292,6 +1729,8 @@ mod tests {
                 proptest::prop_oneof![
                     proptest::char::range('a', 'z').prop_map(PushOp::Push),
                     proptest::prelude::any::<usize>().prop_map(PushOp::Undo),
+                    (proptest::prelude::any::<usize>(), proptest::char::range('A', 'Z'))
+                        .prop_map(|(idx, c)| PushOp::Replace(idx, c)),
                 ],
                 0..50,
             )
@@ -1309,6 +1748,12 @@ mod tests {
                         }
                         PushKind::Undo(mirror[idx % mirror.len()].0)
                     }
+                    PushOp::Replace(idx, c) => {
+                        if mirror.is_empty() {
+                            continue;
+                        }
+                        PushKind::Replace(mirror[idx % mirror.len()].0, c)
+                    }
                 };
                 let entry = LogEntry {
                     id,
@@ -1317,12 +1762,28 @@ mod tests {
                             LogEntryKind::Apply(Box::new(Push(*c)) as StringTransition)
                         }
                         PushKind::Undo(target) => LogEntryKind::Undo(*target),
+                        PushKind::Replace(target, c) => LogEntryKind::Replace {
+                            target: *target,
+                            with: Box::new(Push(*c)) as StringTransition,
+                        },
                     },
                 };
 
-                // `Push` is applicable to any state and never fails, so no
-                // entry here can be rejected - every op lands in the log.
-                sm.apply(entry).unwrap();
+                // `Push` is applicable to any state and never fails, so only
+                // a replace of an entry that isn't an active push can be
+                // rejected.
+                let rejected = match &kind {
+                    PushKind::Replace(target, _) => {
+                        let index = mirror.iter().position(|(id, _)| id == target).unwrap();
+                        !matches!(mirror[index].1, PushKind::Push(_))
+                            || !expected_active(&mirror)[index]
+                    }
+                    PushKind::Push(_) | PushKind::Undo(_) => false,
+                };
+                proptest::prop_assert_eq!(sm.apply(entry).is_err(), rejected);
+                if rejected {
+                    continue;
+                }
                 mirror.push((id, kind));
 
                 proptest::prop_assert_eq!(sm.current(), &expected_state(&mirror));
@@ -1334,38 +1795,70 @@ mod tests {
                     .filter_map(|((id, _), active)| active.then_some(*id))
                     .collect();
                 proptest::prop_assert_eq!(in_effect, expected);
+
+                for (id, kind) in &mirror {
+                    let mut effective = String::new();
+                    if let Some(transition) = sm.effective_transition(*id) {
+                        transition.apply(&mut effective).unwrap();
+                    }
+                    let expected = match kind {
+                        PushKind::Push(c) => expected_char(&mirror, *id, *c).to_string(),
+                        PushKind::Undo(_) | PushKind::Replace(..) => String::new(),
+                    };
+                    proptest::prop_assert_eq!(effective, expected);
+                }
             }
         }
     }
 
     /// What a random `apply` call in the property test above does, over
-    /// non-commuting `Push` transitions: either append a character, or undo a
-    /// previously-appended entry (picked by index into `mirror`, wrapped so
-    /// every index is valid).
+    /// non-commuting `Push` transitions: either append a character, or undo or
+    /// replace a previously-appended entry (picked by index into `mirror`,
+    /// wrapped so every index is valid).
     #[derive(Clone, Debug)]
     enum PushOp {
         Push(char),
         Undo(usize),
+        Replace(usize, char),
     }
 
     enum PushKind {
         Push(char),
         Undo(TransitionId),
+        Replace(TransitionId, char),
     }
 
     /// Model of what the state machine's `current()` should be for a log of
-    /// `Push`/`Undo` entries, written independently of `StateMachine::replay`:
-    /// an entry is active unless some still-active `Undo` targets it, and the
-    /// surviving pushes apply in log order.
+    /// `Push`/`Undo`/`Replace` entries, written independently of
+    /// `StateMachine::replay`: an entry is active unless some still-active
+    /// `Undo` targets it, and the surviving pushes apply in log order, each
+    /// with the character of its latest active replace, if any.
     fn expected_state(entries: &[(TransitionId, PushKind)]) -> String {
         entries
             .iter()
             .zip(expected_active(entries))
-            .filter_map(|((_, kind), active)| match kind {
-                PushKind::Push(c) if active => Some(*c),
-                PushKind::Push(_) | PushKind::Undo(_) => None,
+            .filter_map(|((id, kind), active)| match kind {
+                PushKind::Push(c) if active => Some(expected_char(entries, *id, *c)),
+                PushKind::Push(_) | PushKind::Undo(_) | PushKind::Replace(..) => None,
             })
             .collect()
+    }
+
+    /// The character the push with the id `id` and the character `c` pushes
+    /// in `entries`: the one of its latest active replace, or `c` if there is
+    /// none.
+    fn expected_char(entries: &[(TransitionId, PushKind)], id: TransitionId, c: char) -> char {
+        entries
+            .iter()
+            .zip(expected_active(entries))
+            .rev()
+            .find_map(|((_, kind), active)| match kind {
+                PushKind::Replace(target, replacement) if active && *target == id => {
+                    Some(*replacement)
+                }
+                _ => None,
+            })
+            .unwrap_or(c)
     }
 
     /// Whether each of `entries` is active, i.e. not targeted by a still-active `Undo`, written
@@ -1478,7 +1971,7 @@ mod tests {
             let err = serde_json::from_str::<StateMachine<i64, Arith>>(&json).unwrap_err();
 
             assert!(
-                err.to_string().contains("undo targets unknown transition"),
+                err.to_string().contains("targets unknown transition"),
                 "unexpected error: {err}"
             );
         }
