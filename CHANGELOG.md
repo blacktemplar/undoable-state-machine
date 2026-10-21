@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `StateMachineError::ReplaceTargetNotApply`.
 - `StateMachine::effective_transition`: the transition that runs in place of
   an `Apply`, taking replacements into account.
+- `StateMachine::is_in_effect`: whether the log entry with a given id is in
+  effect.
+- `SessionHistory`: the changes one session made to a state machine, with
+  `undo_last` and `redo_last` undoing and redoing them in order, editor-style,
+  while other sessions append to the same log. Every entry the session
+  appends is one of its actions, including an undo of an entry of its choice.
+  If another session undid the action to undo (or the undo of the action to
+  redo), undoing (redoing) fails with `UndoLastError::UndoneElsewhere`
+  (`RedoLastError::RedoneElsewhere`) rather than passing over it. The history
+  is kept apart from the log and is not persisted.
 
 ### Changed
 
