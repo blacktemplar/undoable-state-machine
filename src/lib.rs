@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, hash_map::Entry},
     error::Error,
     fmt,
 };
@@ -225,11 +225,38 @@ pub struct StateMachine<S, T> {
     /// (duplicate rejection, [`StateMachine::entry`]) are O(1) instead of a linear scan over a
     /// potentially long log.
     index_of: HashMap<TransitionId, usize>,
+    /// The effect of every entry of `log`, at the same index, kept in sync with it so that whether
+    /// an entry is in effect, and which transition runs in place of an `Apply`, is known without a
+    /// walk over the log.
+    effects: Vec<EntryEffect>,
     current: S,
 }
 
+/// What an entry of a [`StateMachine`]'s log does, given the entries after it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EntryEffect {
+    /// An `Undo` in effect, or an `Apply` in effect that runs its own transition.
+    Active,
+    /// An `Apply` in effect that runs the transition of the `Replace` at the index `by` of the log
+    /// in place of its own: the latest `Replace` of it in effect.
+    Replaced { by: usize },
+    /// The latest `Replace` in effect of its target. Its transition runs in place of the target's,
+    /// or, if the target is undone, will once the target is redone.
+    ActiveReplace,
+    /// A `Replace` in effect that a later `Replace` in effect of the same target shadows.
+    InactiveReplace,
+    /// An entry cancelled by a later `Undo` in effect.
+    Undone,
+}
+
+impl EntryEffect {
+    fn is_in_effect(self) -> bool {
+        self != EntryEffect::Undone
+    }
+}
+
 impl<S: fmt::Debug, T: fmt::Debug> fmt::Debug for StateMachine<S, T> {
-    // Omits the internal `index_of` id cache, which is redundant with `log`.
+    // Omits the internal caches `index_of` and `effects`, which are derived from `log`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StateMachine")
             .field("log", &self.log)
@@ -299,12 +326,10 @@ impl<S, T> StateMachine<S, T> {
 
     /// Returns the transition that runs in place of the [`LogEntryKind::Apply`] with the id `id`:
     /// the one of the latest [`LogEntryKind::Replace`] of it that is in effect, or the `Apply`'s
-    /// own transition if there is none. Returns `None` if the log has no `Apply` with this id.
+    /// own transition if there is none. Returns `None` if the log has no `Apply` with this id, or
+    /// if that `Apply` is undone, since then nothing runs in its place.
     ///
-    /// Doesn't take into account whether the `Apply` itself is in effect, so for an undone `Apply`
-    /// this is the transition that would run if it was redone.
-    ///
-    /// Only walks the part of the log after the `Apply`.
+    /// Takes constant time.
     ///
     /// # Examples
     ///
@@ -343,21 +368,15 @@ impl<S, T> StateMachine<S, T> {
     /// assert_eq!(sm.effective_transition(add), Some(&Add(7)));
     /// // only an `Apply` has an effective transition
     /// assert_eq!(sm.effective_transition(replace), None);
+    ///
+    /// // and only while it is in effect
+    /// sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Undo(add)))?;
+    /// assert_eq!(sm.effective_transition(add), None);
     /// # Ok::<(), StateMachineError>(())
     /// ```
     pub fn effective_transition(&self, id: TransitionId) -> Option<&T> {
         let &index = self.index_of.get(&id)?;
-        let LogEntryKind::Apply(original) = &self.log[index].kind else {
-            return None;
-        };
-        // only a later entry can replace the `Apply`, and its status only depends on the entries
-        // after it, so the part of the log after the `Apply` is enough
-        let mut later = rev_log_with_status(&self.log[index + 1..]);
-        let replacement = later.find_map(|(entry, in_effect)| match &entry.kind {
-            LogEntryKind::Replace { target, with } if in_effect && *target == id => Some(with),
-            _ => None,
-        });
-        Some(replacement.unwrap_or(original))
+        transition_running_at(&self.log, &self.effects, index).map(|(_, transition)| transition)
     }
 
     /// Returns the log entries that are in effect, i.e. not cancelled by a later
@@ -409,14 +428,18 @@ impl<S, T> StateMachine<S, T> {
     /// # Ok::<(), StateMachineError>(())
     /// ```
     pub fn rev_in_effect(&self) -> impl Iterator<Item = &LogEntry<T>> {
-        rev_log_with_status(&self.log).filter_map(|(entry, in_effect)| in_effect.then_some(entry))
+        self.log
+            .iter()
+            .zip(&self.effects)
+            .rev()
+            .filter_map(|(entry, effect)| effect.is_in_effect().then_some(entry))
     }
 
     /// Returns whether the entry of the log with the id `id` is in effect, i.e. not cancelled by
     /// a later [`LogEntryKind::Undo`] that is in effect itself, or `None` if the log has no such
     /// entry.
     ///
-    /// Only walks the part of the log after the entry.
+    /// Takes constant time.
     ///
     /// # Examples
     ///
@@ -451,32 +474,118 @@ impl<S, T> StateMachine<S, T> {
     /// # Ok::<(), StateMachineError>(())
     /// ```
     pub fn is_in_effect(&self, id: TransitionId) -> Option<bool> {
-        let &index = self.index_of.get(&id)?;
-        // the walk ends at the entry, whose status only depends on the entries after it
-        Some(
-            rev_log_with_status(&self.log[index..])
-                .last()
-                .is_some_and(|(_, in_effect)| in_effect),
-        )
+        self.index_of
+            .get(&id)
+            .map(|&index| self.effects[index].is_in_effect())
+    }
+
+    /// Updates `effects` for the entry just pushed to `log`. Nothing after the entry can cancel
+    /// it, so it is in effect.
+    ///
+    /// Expects the target of an `Undo` to be an earlier entry (see [`check_target`]), and the
+    /// target of a `Replace` to be an earlier `Apply` in effect, as [`StateMachine::apply`]
+    /// ensures.
+    fn push_effect(&mut self) {
+        let index = self.effects.len();
+        match self.log[index].kind {
+            LogEntryKind::Apply(_) => self.effects.push(EntryEffect::Active),
+            // an undo can cancel or bring back any number of entries, which in turn can change the
+            // active replacements, so it is simplest to start over
+            LogEntryKind::Undo(_) => self.effects = compute_effects(&self.log, &self.index_of),
+            LogEntryKind::Replace { target, .. } => {
+                let target = self.index_of[&target];
+                match self.effects[target] {
+                    EntryEffect::Active => {}
+                    EntryEffect::Replaced { by } => self.effects[by] = EntryEffect::InactiveReplace,
+                    EntryEffect::ActiveReplace
+                    | EntryEffect::InactiveReplace
+                    | EntryEffect::Undone => {
+                        unreachable!("a pushed `Replace` targets an `Apply` in effect")
+                    }
+                }
+                self.effects[target] = EntryEffect::Replaced { by: index };
+                self.effects.push(EntryEffect::ActiveReplace);
+            }
+        }
     }
 }
 
-/// Every entry of `log` from the newest to the oldest, each with whether it is in effect, i.e. not
-/// cancelled by a later [`LogEntryKind::Undo`] that is in effect itself.
-fn rev_log_with_status<T>(log: &[LogEntry<T>]) -> impl Iterator<Item = (&LogEntry<T>, bool)> {
-    // only a later entry can cancel an entry, so by the time the backward walk reaches an entry it
-    // has seen every undo in effect that could cancel it
-    let mut cancelled = HashSet::new();
-    log.iter().rev().map(move |entry| {
-        // ids are unique, so a cancelled id is never looked up again
-        let in_effect = !cancelled.remove(&entry.id);
-        if in_effect {
-            if let LogEntryKind::Undo(target) = entry.kind {
-                cancelled.insert(target);
-            }
+/// Computes the effect of every entry of `log`, where `index_of` is the index of every id in it.
+///
+/// Expects the target of every `Undo` and `Replace` to be an earlier entry (see [`check_target`]).
+fn compute_effects<T>(
+    log: &[LogEntry<T>],
+    index_of: &HashMap<TransitionId, usize>,
+) -> Vec<EntryEffect> {
+    // only a later entry can cancel or replace an entry, so by the time the backward walk reaches
+    // an entry it has seen every undo in effect of it and every replacement in effect of it; until
+    // then, `Active` is a placeholder
+    let mut effects = vec![EntryEffect::Active; log.len()];
+    // per replaced `Apply`, the index of its latest `Replace` in effect, i.e. the first one the
+    // walk met
+    let mut active_replacements = HashMap::new();
+    for (index, entry) in log.iter().enumerate().rev() {
+        if effects[index] == EntryEffect::Undone {
+            continue;
         }
-        (entry, in_effect)
-    })
+        effects[index] = match entry.kind {
+            LogEntryKind::Apply(_) => active_replacements
+                .get(&index)
+                .map_or(EntryEffect::Active, |&by| EntryEffect::Replaced { by }),
+            LogEntryKind::Undo(target) => {
+                effects[index_of[&target]] = EntryEffect::Undone;
+                EntryEffect::Active
+            }
+            LogEntryKind::Replace { target, .. } => {
+                match active_replacements.entry(index_of[&target]) {
+                    Entry::Vacant(vacant) => {
+                        vacant.insert(index);
+                        EntryEffect::ActiveReplace
+                    }
+                    Entry::Occupied(_) => EntryEffect::InactiveReplace,
+                }
+            }
+        };
+    }
+    effects
+}
+
+/// The transition of the [`LogEntryKind::Replace`] at the index `index` of `log`.
+fn replacing_transition<T>(log: &[LogEntry<T>], index: usize) -> &T {
+    match &log[index].kind {
+        LogEntryKind::Replace { with, .. } => with,
+        LogEntryKind::Apply(_) | LogEntryKind::Undo(_) => {
+            unreachable!("only a `Replace` replaces an `Apply`")
+        }
+    }
+}
+
+/// The transition that runs at the index `index` of `log`, given the `effects` of its entries,
+/// with the id of the entry it comes from: the transition of an `Apply` in effect, or the one of
+/// its active replacement if it has one. `None` for any other entry.
+fn transition_running_at<'a, T>(
+    log: &'a [LogEntry<T>],
+    effects: &[EntryEffect],
+    index: usize,
+) -> Option<(TransitionId, &'a T)> {
+    match (effects[index], &log[index].kind) {
+        (EntryEffect::Active, LogEntryKind::Apply(transition)) => Some((log[index].id, transition)),
+        (EntryEffect::Replaced { by }, _) => Some((log[by].id, replacing_transition(log, by))),
+        _ => None,
+    }
+}
+
+/// Checks that `target`, the target of a [`LogEntryKind::Undo`] or [`LogEntryKind::Replace`] at
+/// the index `entry_index` of the log, is an entry before it. Returns `target`'s index on success.
+fn check_target(
+    index_of: &HashMap<TransitionId, usize>,
+    target: TransitionId,
+    entry_index: usize,
+) -> Result<usize, StateMachineError> {
+    match index_of.get(&target) {
+        Some(&index) if index < entry_index => Ok(index),
+        _ => Err(StateMachineError::UnknownTarget(target)),
+    }
 }
 
 /// Checks that `target`, the target of a [`LogEntryKind::Replace`] at index `replace_index` of
@@ -487,14 +596,12 @@ fn check_replace_target<T>(
     target: TransitionId,
     replace_index: usize,
 ) -> Result<usize, StateMachineError> {
-    match index_of.get(&target) {
-        Some(&index) if index < replace_index => match log[index].kind {
-            LogEntryKind::Apply(_) => Ok(index),
-            LogEntryKind::Undo(_) | LogEntryKind::Replace { .. } => {
-                Err(StateMachineError::ReplaceTargetNotApply(target))
-            }
-        },
-        _ => Err(StateMachineError::UnknownTarget(target)),
+    let index = check_target(index_of, target, replace_index)?;
+    match log[index].kind {
+        LogEntryKind::Apply(_) => Ok(index),
+        LogEntryKind::Undo(_) | LogEntryKind::Replace { .. } => {
+            Err(StateMachineError::ReplaceTargetNotApply(target))
+        }
     }
 }
 
@@ -518,6 +625,7 @@ impl<S: Default, T> StateMachine<S, T> {
         Self {
             log: Vec::default(),
             index_of: HashMap::default(),
+            effects: Vec::default(),
             current: Default::default(),
         }
     }
@@ -582,14 +690,22 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
             }
         }
         for (index, entry) in log.iter().enumerate() {
-            if let LogEntryKind::Replace { target, .. } = entry.kind {
-                check_replace_target(&log, &index_of, target, index)?;
+            match entry.kind {
+                LogEntryKind::Apply(_) => {}
+                LogEntryKind::Undo(target) => {
+                    check_target(&index_of, target, index)?;
+                }
+                LogEntryKind::Replace { target, .. } => {
+                    check_replace_target(&log, &index_of, target, index)?;
+                }
             }
         }
-        let current = Self::replay(&log)?;
+        let effects = compute_effects(&log, &index_of);
+        let current = Self::replay(&log, &effects)?;
         Ok(Self {
             log,
             index_of,
+            effects,
             current,
         })
     }
@@ -676,94 +792,69 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
                     Ok(()) => {
                         self.index_of.insert(entry.id, self.log.len());
                         self.log.push(entry);
+                        self.push_effect();
                         Ok(())
                     }
                     Err(err) => {
                         // we need to replay the state
-                        // `active` is exactly what it was before this call, and that already
-                        // replayed cleanly to produce the old `current`, so re-replaying it here
-                        // cannot fail.
-                        self.current = Self::replay(&self.log)
+                        // the log and its effects are exactly what they were before this call,
+                        // and that already replayed cleanly to produce the old `current`, so
+                        // re-replaying it here cannot fail.
+                        self.current = Self::replay(&self.log, &self.effects)
                             .expect("previously-active entries must still replay");
                         Err(StateMachineError::Transition(entry.id, err))
                     }
                 },
                 Err(err) => Err(StateMachineError::Transition(entry.id, err)),
             },
-            LogEntryKind::Undo(_) | LogEntryKind::Replace { .. } => {
-                if let LogEntryKind::Replace { target, .. } = entry.kind {
-                    check_replace_target(&self.log, &self.index_of, target, self.log.len())?;
-                    if self.is_in_effect(target) != Some(true) {
-                        return Err(StateMachineError::ReplaceTargetNotInEffect(target));
-                    }
+            LogEntryKind::Undo(target) => {
+                check_target(&self.index_of, *target, self.log.len())?;
+                self.push_and_replay(entry)
+            }
+            LogEntryKind::Replace { target, .. } => {
+                check_replace_target(&self.log, &self.index_of, *target, self.log.len())?;
+                if self.is_in_effect(*target) != Some(true) {
+                    return Err(StateMachineError::ReplaceTargetNotInEffect(*target));
                 }
-                let id = entry.id;
-                // the duplicate check above makes this insert always succeed
-                self.index_of.insert(id, self.log.len());
-                self.log.push(entry);
-                match Self::replay(&self.log) {
-                    Ok(state) => {
-                        self.current = state;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        self.log.pop();
-                        self.index_of.remove(&id);
-                        Err(err)
-                    }
-                }
+                self.push_and_replay(entry)
             }
         }
     }
 
-    /// Replays every active log entry, in log order, onto a fresh `S::default()`. An `Apply` that
-    /// has a `Replace` in effect runs the latest such replacement's transition instead of its own.
-    ///
-    /// Expects every `Replace` target to be an earlier `Apply` (see [`check_replace_target`]).
+    /// Appends `entry`, an `Undo` or `Replace` whose target is checked already, and replays the log
+    /// with it. On error, the log and [`Self::current`] are left unchanged.
+    fn push_and_replay(&mut self, entry: LogEntry<T>) -> Result<(), StateMachineError> {
+        let id = entry.id;
+        // the duplicate check in `apply` makes this insert always succeed
+        self.index_of.insert(id, self.log.len());
+        self.log.push(entry);
+        self.push_effect();
+        match Self::replay(&self.log, &self.effects) {
+            Ok(state) => {
+                self.current = state;
+                Ok(())
+            }
+            Err(err) => {
+                self.log.pop();
+                self.index_of.remove(&id);
+                self.effects = compute_effects(&self.log, &self.index_of);
+                Err(err)
+            }
+        }
+    }
+
+    /// Replays every `Apply` of `log` that is in effect according to `effects`, in log order, onto
+    /// a fresh `S::default()`. A replaced `Apply` runs the transition of its active replacement
+    /// instead of its own.
     ///
     /// # Errors
     ///
-    /// Returns [`StateMachineError::UnknownTarget`] if an `Undo` targets an id that never appears
-    /// among the entries scanned, or [`StateMachineError::Transition`] if any active transition's
+    /// Returns [`StateMachineError::Transition`] if any active transition's
     /// [`Transition::check_applicable`] or [`Transition::apply`] fails. A failing replacement is
     /// reported with the id of its `Replace`.
-    fn replay(entries: &[LogEntry<T>]) -> Result<S, StateMachineError> {
-        // the targets of the undos in effect that the backward walk hasn't reached yet; an entry
-        // that is not in effect is always such a target
-        let mut unresolved = HashSet::new();
-        // per replaced `Apply` the backward walk hasn't reached yet, the id and transition of the
-        // latest `Replace` of it in effect, i.e. the first one the walk met
-        let mut replacements = HashMap::new();
-        let mut active = Vec::with_capacity(entries.len());
-        for (entry, in_effect) in rev_log_with_status(entries) {
-            if !in_effect {
-                unresolved.remove(&entry.id);
-                replacements.remove(&entry.id);
-                continue;
-            }
-            match &entry.kind {
-                LogEntryKind::Apply(transition) => active.push(
-                    replacements
-                        .remove(&entry.id)
-                        .unwrap_or((entry.id, transition)),
-                ),
-                LogEntryKind::Undo(target) => {
-                    unresolved.insert(*target);
-                }
-                LogEntryKind::Replace { target, with } => {
-                    replacements.entry(*target).or_insert((entry.id, with));
-                }
-            }
-        }
-
-        if let Some(id) = unresolved.into_iter().next() {
-            return Err(StateMachineError::UnknownTarget(id));
-        }
-
-        // The scan above runs backwards (an `Undo` can only cancel an entry before it), so
-        // `active` came out newest-first. Transitions don't commute in general, they have to be
-        // applied in log order.
-        let active = active.into_iter().rev();
+    fn replay(log: &[LogEntry<T>], effects: &[EntryEffect]) -> Result<S, StateMachineError> {
+        // transitions don't commute in general, they have to be applied in log order
+        let active = (0..log.len()).filter_map(|index| transition_running_at(log, effects, index));
 
         let mut state = S::default();
         for (id, transition) in active {
@@ -1560,6 +1651,19 @@ mod tests {
     }
 
     #[test]
+    fn build_rejects_an_undone_undo_of_an_unknown_target() {
+        let unknown_id = TransitionId::new();
+        let undo = undo_entry::<I64Transition>(unknown_id);
+        let undo_undo = undo_entry(undo.id);
+
+        match StateMachine::<i64, I64Transition>::build(vec![undo, undo_undo]) {
+            Err(StateMachineError::UnknownTarget(id)) => assert_eq!(id, unknown_id),
+            Ok(_) => panic!("expected build to fail"),
+            Err(other) => panic!("expected StateMachineError::UnknownTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn build_rejects_undo_appearing_before_its_target() {
         let a = apply_entry(5);
         let a_id = a.id;
@@ -1983,6 +2087,9 @@ mod tests {
                 let rebuilt = StateMachine::<i64, I64Transition>::build(rebuilt_log).unwrap();
 
                 proptest::prop_assert_eq!(*sm.current(), *rebuilt.current());
+                // `apply` updates the effects in place for an `Apply` or `Replace`, `build`
+                // computes them all at once
+                proptest::prop_assert_eq!(&sm.effects, &rebuilt.effects);
             }
         }
 
@@ -2062,15 +2169,18 @@ mod tests {
                     .filter_map(|((id, _), active)| active.then_some(*id))
                     .collect();
                 proptest::prop_assert_eq!(in_effect, expected);
+                proptest::prop_assert_eq!(&sm.effects, &expected_effects(&mirror));
 
-                for (id, kind) in &mirror {
+                for ((id, kind), active) in mirror.iter().zip(expected_active(&mirror)) {
                     let mut effective = String::new();
                     if let Some(transition) = sm.effective_transition(*id) {
                         transition.apply(&mut effective).unwrap();
                     }
                     let expected = match kind {
-                        PushKind::Push(c) => expected_char(&mirror, *id, *c).to_string(),
-                        PushKind::Undo(_) | PushKind::Replace(..) => String::new(),
+                        PushKind::Push(c) if active => expected_char(&mirror, *id, *c).to_string(),
+                        PushKind::Push(_) | PushKind::Undo(_) | PushKind::Replace(..) => {
+                            String::new()
+                        }
                     };
                     proptest::prop_assert_eq!(effective, expected);
                 }
@@ -2128,8 +2238,36 @@ mod tests {
             .unwrap_or(c)
     }
 
+    /// The effect of each of `entries`, written independently of how `StateMachine` keeps them up
+    /// to date: an entry is undone if an active `Undo` targets it, a push is replaced by its latest
+    /// active replace, which is the active replace of its target even if that is undone.
+    fn expected_effects(entries: &[(TransitionId, PushKind)]) -> Vec<EntryEffect> {
+        let active = expected_active(entries);
+        let latest_replace = |target: TransitionId| {
+            (0..entries.len()).rev().find(|&i| {
+                active[i] && matches!(entries[i].1, PushKind::Replace(t, _) if t == target)
+            })
+        };
+        (0..entries.len())
+            .map(|index| {
+                if !active[index] {
+                    return EntryEffect::Undone;
+                }
+                match entries[index].1 {
+                    PushKind::Push(_) => latest_replace(entries[index].0)
+                        .map_or(EntryEffect::Active, |by| EntryEffect::Replaced { by }),
+                    PushKind::Undo(_) => EntryEffect::Active,
+                    PushKind::Replace(target, _) if latest_replace(target) == Some(index) => {
+                        EntryEffect::ActiveReplace
+                    }
+                    PushKind::Replace(..) => EntryEffect::InactiveReplace,
+                }
+            })
+            .collect()
+    }
+
     /// Whether each of `entries` is active, i.e. not targeted by a still-active `Undo`, written
-    /// independently of `rev_log_with_status`.
+    /// independently of `StateMachine`'s effects.
     fn expected_active(entries: &[(TransitionId, PushKind)]) -> Vec<bool> {
         let mut active = vec![false; entries.len()];
         // Back to front: an `Undo` can only target an earlier entry, so

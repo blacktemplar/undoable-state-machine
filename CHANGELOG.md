@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `Apply` is redone. Replacing anything but an `Apply` is rejected with
   `StateMachineError::ReplaceTargetNotApply`.
 - `StateMachine::effective_transition`: the transition that runs in place of
-  an `Apply`, taking replacements into account.
+  an `Apply`, taking replacements into account, or `None` if the `Apply` is
+  undone.
 - `StateMachine::is_in_effect`: whether the log entry with a given id is in
   effect.
 - `SessionHistory`: the changes one session made to a state machine, with
