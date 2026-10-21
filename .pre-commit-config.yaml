@@ -1,0 +1,70 @@
+repos:
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo +nightly fmt --all
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy-all-features
+        name: cargo clippy all features
+        entry: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --workspace
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test-all-features
+        name: cargo test all features
+        entry: cargo test --workspace --all-features
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-doc
+        name: cargo doc
+        entry: env RUSTDOCFLAGS=-Dwarnings cargo doc --all-features --workspace --no-deps
+        language: system
+        types: [rust]
+        pass_filenames: false
+  - repo: https://github.com/DevinR528/cargo-sort
+    rev: v2.1.4
+    hooks:
+      - id: cargo-sort
+  - repo: https://github.com/pre-commit/pre-commit-hooks  # Enables fast path
+    rev: v6.0.0  # Used for the manifest and fallback, not fast-path detection
+    hooks:
+      - id: trailing-whitespace
+      - id: check-added-large-files
+      - id: check-case-conflict
+      - id: check-illegal-windows-names
+      - id: end-of-file-fixer
+      - id: fix-byte-order-marker
+      - id: check-json
+      - id: check-toml
+      - id: check-vcs-permalinks
+      - id: check-yaml
+      - id: check-xml
+      - id: mixed-line-ending
+      - id: check-symlinks
+      - id: destroyed-symlinks
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-shebang-scripts-are-executable
+        exclude_types: [rust]
+      - id: check-executables-have-shebangs
