@@ -14,9 +14,14 @@ use crate::{LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition,
 /// replacement is an action as well. [`Self::undo_last`] undoes the latest action of the session
 /// and [`Self::redo_last`] redoes the action it undid last, each by appending a
 /// [`LogEntryKind::Undo`] naming its target, so that the log means the same however it is merged
-/// with the logs of other sessions. A new action leaves nothing to redo. If another session undid
-/// the action to undo, or the undo of the action to redo, the history no longer matches the log,
-/// and undoing or redoing fails rather than passing over it.
+/// with the logs of other sessions. A new action leaves nothing to redo; the entries of other
+/// sessions change neither what there is to undo nor to redo.
+///
+/// Only an entry of another session can make undoing or redoing fail: one that undid the action to
+/// undo, or the undo of the action to redo, or one that does not apply without the action, or with
+/// it. Then the history ends there: a failed undo leaves nothing to undo, a failed redo nothing to
+/// redo, rather than passing over the action. [`Self::next_undo`] and [`Self::next_redo`] tell
+/// beforehand what has been undone or redone elsewhere.
 ///
 /// The history holds the ids of the entries alone, and is not part of the log: a log restored
 /// from somewhere else comes with no history, and a session ends with its history.
@@ -95,32 +100,59 @@ impl SessionHistory {
         Ok(())
     }
 
+    /// The id of the entry of the action [`Self::undo_last`] undoes next, unless another session
+    /// has undone it already. `None` if there is nothing to undo.
+    ///
+    /// The undo may still be rejected, if an entry in effect does not apply without the action:
+    /// finding that out replays the log, as undoing does.
+    #[must_use]
+    pub fn next_undo<S, T>(&self, machine: &StateMachine<S, T>) -> Option<TransitionId> {
+        // an action of the session undone by another action of the session lies below that one,
+        // which is undone first, so the latest action is only out of effect if another session
+        // undid it
+        let &action = self.done.last()?;
+        (machine.is_in_effect(action) == Some(true)).then_some(action)
+    }
+
+    /// The id of the entry of the action [`Self::redo_last`] redoes next, unless another session
+    /// has redone it already. `None` if there is nothing to redo.
+    ///
+    /// The redo may still be rejected, if the action does not apply together with the entries in
+    /// effect.
+    #[must_use]
+    pub fn next_redo<S, T>(&self, machine: &StateMachine<S, T>) -> Option<TransitionId> {
+        let &(action, undo) = self.undone.last()?;
+        (machine.is_in_effect(undo) == Some(true)).then_some(action)
+    }
+
     /// Undoes the latest action of this session that [`Self::undo_last`] has not undone, and
     /// returns the id of the undo entry appended for that.
     ///
     /// As long as only this session appends to the log, undoing its actions one after another
-    /// returns to the states the log was in before them, which cannot fail. Only an entry another
-    /// session appended can make it fail: one that undid the action, or one that depends on it.
+    /// returns to the states the log was in before them, which cannot fail.
     ///
     /// # Errors
     /// Returns [`UndoLastError::NothingToUndo`] if the session has no such action,
     /// [`UndoLastError::UndoneElsewhere`] if another session has undone it, and
     /// [`UndoLastError::Rejected`] if an entry in effect does not apply without it, see
-    /// [`StateMachine::apply`]. In each case neither the log nor the history changes, so the
-    /// action stays the next one to undo.
+    /// [`StateMachine::apply`]. The log does not change, and in the last two cases the session is
+    /// left with nothing to undo; what it can redo stays.
     pub fn undo_last<S: Default, T: Transition<S>>(
         &mut self,
         machine: &mut StateMachine<S, T>,
     ) -> Result<TransitionId, UndoLastError> {
-        let &action = self.done.last().ok_or(UndoLastError::NothingToUndo)?;
-        // an action of the session undone by another action of the session lies below that one,
-        // which is undone first, so the latest action is only out of effect if another session
-        // undid it
-        if machine.is_in_effect(action) != Some(true) {
-            return Err(UndoLastError::UndoneElsewhere);
+        if self.done.is_empty() {
+            return Err(UndoLastError::NothingToUndo);
         }
+        let Some(action) = self.next_undo(machine) else {
+            self.done.clear();
+            return Err(UndoLastError::UndoneElsewhere);
+        };
         let id = TransitionId::new();
-        machine.apply(LogEntry::new(id, LogEntryKind::Undo(action)))?;
+        if let Err(error) = machine.apply(LogEntry::new(id, LogEntryKind::Undo(action))) {
+            self.done.clear();
+            return Err(UndoLastError::Rejected(error));
+        }
         self.done.pop();
         self.undone.push((action, id));
         Ok(id)
@@ -134,18 +166,22 @@ impl SessionHistory {
     /// Returns [`RedoLastError::NothingToRedo`] if there is no such action,
     /// [`RedoLastError::RedoneElsewhere`] if another session has undone the undo already, and
     /// [`RedoLastError::Rejected`] if the action does not apply together with the entries in
-    /// effect, see [`StateMachine::apply`]. In each case neither the log nor the history changes,
-    /// so the action stays the next one to redo.
+    /// effect, see [`StateMachine::apply`]. The log does not change, and in the last two cases the
+    /// session is left with nothing to redo; what it can undo stays.
     pub fn redo_last<S: Default, T: Transition<S>>(
         &mut self,
         machine: &mut StateMachine<S, T>,
     ) -> Result<TransitionId, RedoLastError> {
         let &(action, undo) = self.undone.last().ok_or(RedoLastError::NothingToRedo)?;
         if machine.is_in_effect(undo) != Some(true) {
+            self.undone.clear();
             return Err(RedoLastError::RedoneElsewhere);
         }
         let id = TransitionId::new();
-        machine.apply(LogEntry::new(id, LogEntryKind::Undo(undo)))?;
+        if let Err(error) = machine.apply(LogEntry::new(id, LogEntryKind::Undo(undo))) {
+            self.undone.clear();
+            return Err(RedoLastError::Rejected(error));
+        }
         self.undone.pop();
         self.done.push(action);
         Ok(id)
@@ -353,7 +389,7 @@ mod tests {
     /// An action another session undid is not passed over, which would undo an older action while
     /// a newer one could still come back, e.g. if the other session undoes its undo.
     #[test]
-    fn an_action_another_session_undid_stops_undoing() {
+    fn an_action_another_session_undid_is_not_offered_until_it_is_back() {
         let mut sm = StateMachine::<String, StringTransition>::new();
         let mut history = SessionHistory::new();
         push_in(&mut history, &mut sm, 'a');
@@ -362,41 +398,90 @@ mod tests {
             &mut sm,
             LogEntry::new(TransitionId::new(), LogEntryKind::Undo(b)),
         );
+
+        assert_eq!(history.next_undo(&sm), None);
+
+        sm.apply(LogEntry::new(
+            TransitionId::new(),
+            LogEntryKind::Undo(elsewhere),
+        ))
+        .unwrap();
+        assert_eq!(history.next_undo(&sm), Some(b));
+        history.undo_last(&mut sm).unwrap();
+        assert_eq!(sm.current(), "a");
+    }
+
+    #[test]
+    fn undoing_an_action_another_session_undid_leaves_nothing_to_undo_but_keeps_what_to_redo() {
+        let mut sm = StateMachine::<String, StringTransition>::new();
+        let mut history = SessionHistory::new();
+        push_in(&mut history, &mut sm, 'a');
+        let b = push_in(&mut history, &mut sm, 'b');
+        let c = push_in(&mut history, &mut sm, 'c');
+        history.undo_last(&mut sm).unwrap();
+        sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Undo(b)))
+            .unwrap();
         let log_len = sm.log().len();
 
         assert!(matches!(
             history.undo_last(&mut sm),
             Err(UndoLastError::UndoneElsewhere)
         ));
+
         assert_eq!(sm.log().len(), log_len);
         assert_eq!(sm.current(), "a");
-
-        // once the other session takes its undo back, the action is the one undone next
-        sm.apply(LogEntry::new(
-            TransitionId::new(),
-            LogEntryKind::Undo(elsewhere),
-        ))
-        .unwrap();
-        history.undo_last(&mut sm).unwrap();
-        assert_eq!(sm.current(), "a");
+        assert!(matches!(
+            history.undo_last(&mut sm),
+            Err(UndoLastError::NothingToUndo)
+        ));
+        assert_eq!(history.next_redo(&sm), Some(c));
+        history.redo_last(&mut sm).unwrap();
+        assert_eq!(sm.current(), "ac");
     }
 
     #[test]
-    fn an_undo_another_session_undid_stops_redoing() {
+    fn redoing_an_action_another_session_redid_leaves_nothing_to_redo_but_keeps_what_to_undo() {
         let mut sm = StateMachine::<String, StringTransition>::new();
         let mut history = SessionHistory::new();
-        push_in(&mut history, &mut sm, 'a');
+        let a = push_in(&mut history, &mut sm, 'a');
+        push_in(&mut history, &mut sm, 'b');
+        push_in(&mut history, &mut sm, 'c');
+        history.undo_last(&mut sm).unwrap();
         let undo = history.undo_last(&mut sm).unwrap();
         sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo)))
             .unwrap();
         let log_len = sm.log().len();
+        assert_eq!(history.next_redo(&sm), None);
 
         assert!(matches!(
             history.redo_last(&mut sm),
             Err(RedoLastError::RedoneElsewhere)
         ));
+
         assert_eq!(sm.log().len(), log_len);
-        assert_eq!(sm.current(), "a");
+        assert_eq!(sm.current(), "ab");
+        assert!(matches!(
+            history.redo_last(&mut sm),
+            Err(RedoLastError::NothingToRedo)
+        ));
+        assert_eq!(history.next_undo(&sm), Some(a));
+        history.undo_last(&mut sm).unwrap();
+        assert_eq!(sm.current(), "b");
+    }
+
+    /// Entries of other sessions are no actions of this one, so they leave what it undid to redo.
+    #[test]
+    fn an_entry_of_another_session_leaves_what_to_redo() {
+        let mut sm = StateMachine::<String, StringTransition>::new();
+        let mut history = SessionHistory::new();
+        let a = push_in(&mut history, &mut sm, 'a');
+        history.undo_last(&mut sm).unwrap();
+
+        sm.apply(push_entry('b')).unwrap();
+
+        assert_eq!(history.next_redo(&sm), Some(a));
+        history.redo_last(&mut sm).unwrap();
+        assert_eq!(sm.current(), "ab");
     }
 
     /// An action the session undid itself, by an undo targeting it, lies below that undo, so it is
@@ -426,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn an_undo_an_entry_of_another_session_depends_on_is_rejected() {
+    fn an_undo_an_entry_of_another_session_depends_on_is_rejected_and_leaves_nothing_to_undo() {
         let mut sm = StateMachine::<i64, I64Transition>::new();
         let mut history = SessionHistory::new();
         history.apply(&mut sm, apply_entry(5)).unwrap();
@@ -442,10 +527,46 @@ mod tests {
         assert!(matches!(result, Err(UndoLastError::Rejected(_))));
         assert_eq!(sm.log().len(), log_len);
         assert_eq!(*sm.current(), 5);
-        // the action is still the one to undo
         assert!(matches!(
             history.undo_last(&mut sm),
-            Err(UndoLastError::Rejected(_))
+            Err(UndoLastError::NothingToUndo)
         ));
+    }
+
+    #[test]
+    fn a_redo_that_no_longer_applies_is_rejected_and_leaves_nothing_to_redo() {
+        let mut sm = StateMachine::<i64, I64Transition>::new();
+        let mut history = SessionHistory::new();
+        let first = apply_entry(1);
+        let first_id = first.id();
+        history.apply(&mut sm, first).unwrap();
+        let elsewhere = apply_get_id(&mut sm, apply_entry(5));
+        history
+            .apply(
+                &mut sm,
+                LogEntry::new(
+                    TransitionId::new(),
+                    LogEntryKind::Apply(Box::new(RequireAtLeast(6))),
+                ),
+            )
+            .unwrap();
+        history.undo_last(&mut sm).unwrap();
+        sm.apply(LogEntry::new(
+            TransitionId::new(),
+            LogEntryKind::Undo(elsewhere),
+        ))
+        .unwrap();
+        let log_len = sm.log().len();
+
+        let result = history.redo_last(&mut sm);
+
+        assert!(matches!(result, Err(RedoLastError::Rejected(_))));
+        assert_eq!(sm.log().len(), log_len);
+        assert_eq!(*sm.current(), 1);
+        assert!(matches!(
+            history.redo_last(&mut sm),
+            Err(RedoLastError::NothingToRedo)
+        ));
+        assert_eq!(history.next_undo(&sm), Some(first_id));
     }
 }

@@ -17,7 +17,8 @@ previous version.
 
 For undo and redo as in an editor, a `SessionHistory` keeps track of the changes one session made,
 and undoes and redoes them in the order it made them, as ordinary undo entries. A change another
-session appended to the same log, e.g. through a sync, is never undone by it.
+session appended to the same log, e.g. through a sync, is never undone by it; if such a change
+makes an undo (redo) fail, the history has nothing more to undo (redo).
 
 The crate has no notion of any particular domain: it is generic over the state type `S` and the
 transition type `T: Transition<S>`, and consumers supply their own.

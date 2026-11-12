@@ -38,9 +38,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   redo), undoing (redoing) fails with `UndoLastError::UndoneElsewhere`
   (`RedoLastError::RedoneElsewhere`) rather than passing over it. The history
   is kept apart from the log and is not persisted.
+- `SessionHistory::next_undo` and `next_redo`: the action undoing (redoing)
+  acts on next, unless another session has undone (redone) it already.
 
 ### Changed
 
+- A `SessionHistory` whose undo fails because of another session's entry
+  (`UndoLastError::UndoneElsewhere` or `Rejected`) is left with nothing to
+  undo, and one whose redo fails so with nothing to redo, rather than keeping
+  the action to try again; what it can redo (undo) stays.
 - `StateMachineError::UnknownTarget`'s message no longer mentions undo, as a
   replace can target an unknown id too.
 
