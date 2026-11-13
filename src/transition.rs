@@ -5,8 +5,9 @@ use std::error::Error;
 #[cfg(doc)]
 use crate::StateMachine;
 
-/// Typically a log will contain many different transitions (using `Box<dyn Transition<S> + ...>`)
-/// which can also return many different types of errors.
+/// The error [`Transition::check_applicable`] rejects a transition with. Typically a log will
+/// contain many different transitions (using `Box<dyn Transition<S> + ...>`, or an enum of them)
+/// which can also reject with many different types of errors.
 pub type TransitionError = Box<dyn Error + Send + Sync>;
 
 /// A transition that mutates state, split into a pure pre-check and the mutation itself.
@@ -23,9 +24,8 @@ pub type TransitionError = Box<dyn Error + Send + Sync>;
 ///         Ok(())
 ///     }
 ///
-///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+///     fn apply(&self, state: &mut i64) {
 ///         *state += self.0;
-///         Ok(())
 ///     }
 /// }
 /// ```
@@ -38,15 +38,12 @@ pub trait Transition<S> {
 
     /// Applies the transition by mutating `state` in place.
     ///
-    /// Only called after [`Transition::check_applicable`] returned `Ok(())`, and must be
-    /// deterministic: the same input state must always produce the same mutation, since
-    /// [`StateMachine::apply`] relies on this to recover by replaying the log if this method
-    /// fails. On error, treat `state` as dirty and don't rely on its contents. Errors here
-    /// should be rare - catch problems early in [`Transition::check_applicable`] instead.
-    ///
-    /// # Errors
-    /// An error occurs during mutation that was not caught in [`Transition::check_applicable`].
-    fn apply(&self, state: &mut S) -> Result<(), TransitionError>;
+    /// Only called right after [`Transition::check_applicable`] returned `Ok(())` for the same
+    /// `state`, so it cannot fail: whatever could make the transition inapplicable belongs in
+    /// that check. It must be deterministic, i.e. the same state must always produce the same
+    /// mutation, since the state machine replays the log to undo or replace an entry, and expects
+    /// to arrive at the same state as before for every entry that it leaves untouched.
+    fn apply(&self, state: &mut S);
 }
 
 /// Useful when using `Box<dyn Transition<...> + ...>` as `T` in [`StateMachine`]
@@ -54,7 +51,7 @@ impl<S, T: ?Sized + Transition<S>> Transition<S> for Box<T> {
     fn check_applicable(&self, state: &S) -> Result<(), TransitionError> {
         (**self).check_applicable(state)
     }
-    fn apply(&self, state: &mut S) -> Result<(), TransitionError> {
-        (**self).apply(state)
+    fn apply(&self, state: &mut S) {
+        (**self).apply(state);
     }
 }

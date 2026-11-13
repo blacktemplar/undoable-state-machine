@@ -11,25 +11,8 @@ impl Transition<i64> for Add {
         Ok(())
     }
 
-    fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    fn apply(&self, state: &mut i64) {
         *state += self.0;
-        Ok(())
-    }
-}
-
-// Always reports itself as applicable, then fails inside `apply` after
-// already mutating `state`. Models a transition whose `apply` breaks the
-// "should be rare/avoided" guidance, to exercise that failure path.
-pub struct FailDuringApply(pub i64);
-
-impl Transition<i64> for FailDuringApply {
-    fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
-        Ok(())
-    }
-
-    fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
-        *state += self.0;
-        Err("boom".to_string().into())
     }
 }
 
@@ -46,30 +29,7 @@ impl Transition<i64> for RequireAtLeast {
         }
     }
 
-    fn apply(&self, _state: &mut i64) -> Result<(), TransitionError> {
-        Ok(())
-    }
-}
-
-// Passes `check_applicable` unconditionally, but `apply` fails unless
-// `state` is already at least `self.0`. Unlike `RequireAtLeast`, this
-// makes the *dependency* break surface from `apply` instead of
-// `check_applicable`.
-pub struct FailApplyIfBelow(pub i64);
-
-impl Transition<i64> for FailApplyIfBelow {
-    fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
-        Ok(())
-    }
-
-    fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
-        if *state < self.0 {
-            Err(format!("need at least {} to apply, have {}", self.0, state).into())
-        } else {
-            *state += 1;
-            Ok(())
-        }
-    }
+    fn apply(&self, _state: &mut i64) {}
 }
 
 pub fn apply_entry(value: i64) -> LogEntry<I64Transition> {
@@ -91,9 +51,8 @@ impl Transition<String> for Push {
         Ok(())
     }
 
-    fn apply(&self, state: &mut String) -> Result<(), TransitionError> {
+    fn apply(&self, state: &mut String) {
         state.push(self.0);
-        Ok(())
     }
 }
 

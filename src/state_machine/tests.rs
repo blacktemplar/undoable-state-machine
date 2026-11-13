@@ -4,8 +4,8 @@ use super::{StateMachine, effects::EntryEffect};
 use crate::{
     LogEntry, LogEntryKind, StateMachineError, Transition, TransitionId,
     test_util::{
-        Add, FailApplyIfBelow, FailDuringApply, I64Transition, Push, RequireAtLeast,
-        StringTransition, apply_entry, apply_get_id, push_entry, replace_push_entry, undo_entry,
+        Add, I64Transition, Push, RequireAtLeast, StringTransition, apply_entry, apply_get_id,
+        push_entry, replace_push_entry, undo_entry,
     },
 };
 
@@ -92,35 +92,6 @@ fn append_rejects_a_not_applicable_transition_without_mutating_state() {
 }
 
 #[test]
-fn append_apply_failure_does_not_grow_log() {
-    let mut sm = StateMachine::<i64, I64Transition>::default();
-    sm.apply(apply_entry(5)).unwrap();
-
-    let entry: LogEntry<I64Transition> = LogEntry::new(
-        TransitionId::new(),
-        LogEntryKind::Apply(Box::new(FailDuringApply(100))),
-    );
-    let failing_id = entry.id();
-    let err = sm.apply(entry).unwrap_err();
-
-    match err {
-        StateMachineError::Transition(id, err) => {
-            assert_eq!(id, failing_id);
-            assert_eq!(err.to_string(), "boom");
-        }
-        other => panic!("expected StateMachineError::Transition, got {other:?}"),
-    }
-    // The failing entry is never recorded in the log. `current` was
-    // already mutated by `apply` before it failed though, so per
-    // `Transition::apply`'s contract it must now be treated as dirty and
-    // not relied upon. Recovery means rebuilding from the (unaffected) log.
-    assert_eq!(sm.log().len(), 1);
-
-    let rebuilt = StateMachine::<i64, I64Transition>::build(vec![apply_entry(5)]).unwrap();
-    assert_eq!(*rebuilt.current(), 5);
-}
-
-#[test]
 fn undo_cancels_a_prior_apply() {
     let mut sm = StateMachine::<i64, I64Transition>::default();
     let first: LogEntry<I64Transition> =
@@ -186,42 +157,6 @@ fn undo_that_breaks_a_later_entry_is_rejected_and_blames_that_entry() {
     assert_eq!(*sm.current(), 10);
     assert_eq!(sm.log().len(), 2);
     assert!(sm.entry(undo_id).is_none());
-}
-
-#[test]
-fn undo_that_breaks_a_later_entrys_apply_is_rejected_and_blames_that_entry() {
-    let mut sm = StateMachine::<i64, I64Transition>::default();
-
-    let add: LogEntry<I64Transition> =
-        LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(10))));
-    let add_id = add.id();
-    sm.apply(add).unwrap();
-
-    // Succeeds now, while `add`'s effect keeps `state` at least 10, but
-    // its `check_applicable` doesn't encode that dependency - only its
-    // `apply` does.
-    let guard: LogEntry<I64Transition> = LogEntry::new(
-        TransitionId::new(),
-        LogEntryKind::Apply(Box::new(FailApplyIfBelow(10))),
-    );
-    let guard_id = guard.id();
-    sm.apply(guard).unwrap();
-    assert_eq!(*sm.current(), 11);
-
-    let err = sm
-        .apply(LogEntry::new(
-            TransitionId::new(),
-            LogEntryKind::Undo(add_id),
-        ))
-        .unwrap_err();
-
-    match err {
-        StateMachineError::Transition(id, _) => assert_eq!(id, guard_id),
-        other => panic!("expected StateMachineError::Transition, got {other:?}"),
-    }
-    // The undo itself is rejected: current and the log are unaffected.
-    assert_eq!(*sm.current(), 11);
-    assert_eq!(sm.log().len(), 2);
 }
 
 #[test]
@@ -304,14 +239,14 @@ fn build_with_undone_undo_computes_current() {
 fn build_surfaces_the_failing_transition() {
     let entry: LogEntry<I64Transition> = LogEntry::new(
         TransitionId::new(),
-        LogEntryKind::Apply(Box::new(FailDuringApply(100))),
+        LogEntryKind::Apply(Box::new(RequireAtLeast(100))),
     );
     let failing_id = entry.id();
 
-    match StateMachine::<i64, I64Transition>::build(vec![entry]) {
+    match StateMachine::<i64, I64Transition>::build(vec![apply_entry(5), entry]) {
         Err(StateMachineError::Transition(id, err)) => {
             assert_eq!(id, failing_id);
-            assert_eq!(err.to_string(), "boom");
+            assert_eq!(err.to_string(), "need at least 100, have 5");
         }
         Ok(_) => panic!("expected build to fail"),
         Err(other) => panic!("expected StateMachineError::Transition, got {other:?}"),
@@ -508,7 +443,7 @@ fn a_failing_replacement_is_rejected_and_blames_the_replace() {
             replace_id,
             LogEntryKind::Replace {
                 target: add_id,
-                with: Box::new(FailDuringApply(1)),
+                with: Box::new(RequireAtLeast(1)),
             },
         ))
         .unwrap_err();
@@ -516,7 +451,7 @@ fn a_failing_replacement_is_rejected_and_blames_the_replace() {
     match err {
         StateMachineError::Transition(id, err) => {
             assert_eq!(id, replace_id);
-            assert_eq!(err.to_string(), "boom");
+            assert_eq!(err.to_string(), "need at least 1, have 0");
         }
         other => panic!("expected StateMachineError::Transition, got {other:?}"),
     }
@@ -627,6 +562,70 @@ fn rev_in_effect_keeps_a_replaced_apply_and_its_shadowed_replacements() {
 
     let in_effect: Vec<_> = sm.rev_in_effect().map(LogEntry::id).collect();
     assert_eq!(in_effect, [z_id, y_id, x_id]);
+}
+
+/// The pushes `rev_in_effect_applied` yields, as the id it yields with each and the character it
+/// pushes.
+fn applied_pushes(sm: &StateMachine<String, StringTransition>) -> Vec<(TransitionId, String)> {
+    sm.rev_in_effect_applied()
+        .map(|(id, transition)| {
+            let mut pushed = String::new();
+            transition.apply(&mut pushed);
+            (id, pushed)
+        })
+        .collect()
+}
+
+#[test]
+fn rev_in_effect_applied_yields_a_replaced_apply_with_its_id_and_the_replacing_transition() {
+    let mut sm = StateMachine::<String, StringTransition>::default();
+    let a_id = apply_get_id(&mut sm, push_entry('a'));
+    let b_id = apply_get_id(&mut sm, push_entry('b'));
+    apply_get_id(&mut sm, replace_push_entry(a_id, 'x'));
+    apply_get_id(&mut sm, replace_push_entry(a_id, 'y'));
+
+    assert_eq!(
+        applied_pushes(&sm),
+        [(b_id, "b".to_owned()), (a_id, "y".to_owned())]
+    );
+}
+
+#[test]
+fn rev_in_effect_applied_skips_undone_applies_and_keeps_redone_ones() {
+    let mut sm = StateMachine::<String, StringTransition>::default();
+    let a_id = apply_get_id(&mut sm, push_entry('a'));
+    let b_id = apply_get_id(&mut sm, push_entry('b'));
+    let c_id = apply_get_id(&mut sm, push_entry('c'));
+    apply_get_id(&mut sm, undo_entry(b_id));
+    let undo_c = apply_get_id(&mut sm, undo_entry(c_id));
+    apply_get_id(&mut sm, undo_entry(undo_c));
+
+    assert_eq!(
+        applied_pushes(&sm),
+        [(c_id, "c".to_owned()), (a_id, "a".to_owned())]
+    );
+}
+
+#[test]
+fn apply_new_applies_the_transition_as_an_apply_with_the_id_it_returns() {
+    let mut sm = StateMachine::<i64, I64Transition>::default();
+    let id = sm.apply_new(Box::new(Add(5))).unwrap();
+
+    assert_eq!(*sm.current(), 5);
+    assert!(matches!(
+        sm.entry(id).map(LogEntry::kind),
+        Some(LogEntryKind::Apply(_))
+    ));
+}
+
+#[test]
+fn apply_new_rejects_a_not_applicable_transition_without_changing_the_log() {
+    let mut sm = StateMachine::<i64, I64Transition>::default();
+
+    let result = sm.apply_new(Box::new(RequireAtLeast(1)));
+
+    assert!(matches!(result, Err(StateMachineError::Transition(..))));
+    assert!(sm.log().is_empty());
 }
 
 /// What a random `apply` call in the property test below does: either
@@ -809,7 +808,7 @@ proptest::proptest! {
             for ((id, kind), active) in mirror.iter().zip(expected_active(&mirror)) {
                 let mut effective = String::new();
                 if let Some(transition) = sm.effective_transition(*id) {
-                    transition.apply(&mut effective).unwrap();
+                    transition.apply(&mut effective);
                 }
                 let expected = match kind {
                     PushKind::Push(c) if active => expected_char(&mirror, *id, *c).to_string(),
@@ -819,6 +818,27 @@ proptest::proptest! {
                 };
                 proptest::prop_assert_eq!(effective, expected);
             }
+
+            let applied: Vec<_> = sm
+                .rev_in_effect_applied()
+                .map(|(id, transition)| {
+                    let mut pushed = String::new();
+                    transition.apply(&mut pushed);
+                    (id, pushed)
+                })
+                .collect();
+            let expected: Vec<_> = mirror
+                .iter()
+                .zip(expected_active(&mirror))
+                .rev()
+                .filter_map(|((id, kind), active)| match kind {
+                    PushKind::Push(c) if active => {
+                        Some((*id, expected_char(&mirror, *id, *c).to_string()))
+                    }
+                    PushKind::Push(_) | PushKind::Undo(_) | PushKind::Replace(..) => None,
+                })
+                .collect();
+            proptest::prop_assert_eq!(applied, expected);
         }
     }
 }
@@ -958,12 +978,11 @@ mod serde_support {
             Ok(())
         }
 
-        fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+        fn apply(&self, state: &mut i64) {
             match self {
                 Arith::Add(v) => *state += v,
                 Arith::Mul(v) => *state *= v,
             }
-            Ok(())
         }
     }
 

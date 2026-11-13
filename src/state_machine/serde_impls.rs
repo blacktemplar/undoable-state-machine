@@ -31,12 +31,11 @@ use crate::{LogEntry, StateMachine, Transition};
 ///         Ok(())
 ///     }
 ///
-///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+///     fn apply(&self, state: &mut i64) {
 ///         match self {
 ///             Arith::Add(v) => *state += v,
 ///             Arith::Mul(v) => *state *= v,
 ///         }
-///         Ok(())
 ///     }
 /// }
 ///

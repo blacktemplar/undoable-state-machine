@@ -71,9 +71,8 @@ impl<S, T> StateMachine<S, T> {
     ///         Ok(())
     ///     }
     ///
-    ///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    ///     fn apply(&self, state: &mut i64) {
     ///         *state += self.0;
-    ///         Ok(())
     ///     }
     /// }
     ///
@@ -117,9 +116,8 @@ impl<S, T> StateMachine<S, T> {
     ///         Ok(())
     ///     }
     ///
-    ///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    ///     fn apply(&self, state: &mut i64) {
     ///         *state += self.0;
-    ///         Ok(())
     ///     }
     /// }
     ///
@@ -176,9 +174,8 @@ impl<S, T> StateMachine<S, T> {
     ///         Ok(())
     ///     }
     ///
-    ///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    ///     fn apply(&self, state: &mut i64) {
     ///         *state += self.0;
-    ///         Ok(())
     ///     }
     /// }
     ///
@@ -205,6 +202,75 @@ impl<S, T> StateMachine<S, T> {
             .filter_map(|(entry, effect)| effect.is_in_effect().then_some(entry))
     }
 
+    /// Returns the [`LogEntryKind::Apply`] entries in effect, from the newest to the oldest, each
+    /// as its id and the transition that runs in its place, see [`Self::effective_transition`]:
+    /// the one of its latest [`LogEntryKind::Replace`] in effect, if it has one.
+    ///
+    /// The id is the one of the `Apply`, which an `Undo` or `Replace` of it targets, also when
+    /// the transition comes from a `Replace`. Like [`Self::rev_in_effect`], the iterator is lazy,
+    /// so finding the latest transition in effect that matches some condition costs only the part
+    /// of the log that lies after it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use undoable_state_machine::{
+    ///     LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition, TransitionError,
+    ///     TransitionId,
+    /// };
+    ///
+    /// #[derive(Debug, PartialEq)]
+    /// enum Arith {
+    ///     Add(i64),
+    ///     Mul(i64),
+    /// }
+    ///
+    /// impl Transition<i64> for Arith {
+    ///     fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     fn apply(&self, state: &mut i64) {
+    ///         match self {
+    ///             Arith::Add(v) => *state += v,
+    ///             Arith::Mul(v) => *state *= v,
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// let mut sm = StateMachine::<i64, Arith>::new();
+    /// let add_5 = sm.apply_new(Arith::Add(5))?;
+    /// let mul_2 = sm.apply_new(Arith::Mul(2))?;
+    /// let add_1 = sm.apply_new(Arith::Add(1))?;
+    /// sm.apply(LogEntry::new(
+    ///     TransitionId::new(),
+    ///     LogEntryKind::Undo(add_1),
+    /// ))?;
+    /// sm.apply(LogEntry::new(
+    ///     TransitionId::new(),
+    ///     LogEntryKind::Replace {
+    ///         target: mul_2,
+    ///         with: Arith::Mul(3),
+    ///     },
+    /// ))?;
+    ///
+    /// let applied: Vec<_> = sm.rev_in_effect_applied().collect();
+    /// assert_eq!(applied, [(mul_2, &Arith::Mul(3)), (add_5, &Arith::Add(5))]);
+    ///
+    /// // the latest multiplication in effect
+    /// let latest_mul = sm
+    ///     .rev_in_effect_applied()
+    ///     .find_map(|(id, transition)| matches!(transition, Arith::Mul(_)).then_some(id));
+    /// assert_eq!(latest_mul, Some(mul_2));
+    /// # Ok::<(), StateMachineError>(())
+    /// ```
+    pub fn rev_in_effect_applied(&self) -> impl Iterator<Item = (TransitionId, &T)> {
+        (0..self.log.len()).rev().filter_map(|index| {
+            transition_running_at(&self.log, &self.effects, index)
+                .map(|(_, transition)| (self.log[index].id(), transition))
+        })
+    }
+
     /// Returns whether the entry of the log with the id `id` is in effect, i.e. not cancelled by
     /// a later [`LogEntryKind::Undo`] that is in effect itself, or `None` if the log has no such
     /// entry.
@@ -226,9 +292,8 @@ impl<S, T> StateMachine<S, T> {
     ///         Ok(())
     ///     }
     ///
-    ///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    ///     fn apply(&self, state: &mut i64) {
     ///         *state += self.0;
-    ///         Ok(())
     ///     }
     /// }
     ///
@@ -342,7 +407,10 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     ///
     /// Equivalent to starting from [`Self::new`] and calling [`Self::apply`] with each entry in
     /// order, but computes `current` in a single backward-then-forward pass instead of replaying
-    /// the growing log again after every entry.
+    /// the growing log again after every entry, and never runs an undone transition. That changes
+    /// what is rejected: an entry that does not apply at its point of the log, but is undone by a
+    /// later entry, makes [`Self::apply`] fail before it gets to the undo, while `build` accepts
+    /// the log.
     ///
     /// # Examples
     ///
@@ -359,9 +427,8 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     ///         Ok(())
     ///     }
     ///
-    ///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    ///     fn apply(&self, state: &mut i64) {
     ///         *state += self.0;
-    ///         Ok(())
     ///     }
     /// }
     ///
@@ -381,7 +448,7 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     ///
     /// Returns an error under the same conditions as [`Self::apply`]'s `Undo` and `Replace` cases:
     /// an unknown undo or replace target, a replace target that is not an `Apply`, or an active
-    /// transition that fails to apply. Also returns [`StateMachineError::DuplicateId`] if two
+    /// transition that is not applicable. Also returns [`StateMachineError::DuplicateId`] if two
     /// entries in `log` share the same id.
     ///
     /// Unlike [`Self::apply`], accepts a `Replace` whose target is undone at that point of the log,
@@ -418,12 +485,10 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// Applies `entry` and appends it to the log. On error, the log and [`Self::current`] are
     /// left unchanged.
     ///
-    /// If the logs contain undos then calling this method is more efficient than applying all
-    /// entries one by one with [`Self::apply`] since undone entries will never get applied in the
-    /// first place. Note, however that this changes the semantics in case an undone entry would
-    /// error. If you call [`Self::apply`] for each entry then it would error before applying the
-    /// undo, while [`Self::apply`] fully ignores the undone entry and never applies it and never
-    /// surfaces the error.
+    /// An `Apply` runs its transition on [`Self::current`] alone. An `Undo` or `Replace` replays
+    /// every entry in effect from `S::default()`, since any later entry may depend on what it
+    /// changes, and an `Undo` recomputes which entries are in effect, both in time linear in the
+    /// length of the log.
     ///
     /// # Examples
     ///
@@ -440,9 +505,8 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     ///         Ok(())
     ///     }
     ///
-    ///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    ///     fn apply(&self, state: &mut i64) {
     ///         *state += self.0;
-    ///         Ok(())
     ///     }
     /// }
     ///
@@ -475,43 +539,27 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     ///
     /// Returns [`StateMachineError::Transition`] if the transition (for `Apply`), the replacing
     /// transition (for `Replace`) or some later active entry that depended on the target (for
-    /// `Undo` and `Replace`) fails; [`StateMachineError::UnknownTarget`] if `Undo` or `Replace`
-    /// targets an id not present earlier in the log. Returns
+    /// `Undo` and `Replace`) is not applicable; [`StateMachineError::UnknownTarget`] if `Undo` or
+    /// `Replace` targets an id not present earlier in the log. Returns
     /// [`StateMachineError::ReplaceTargetNotApply`] if `Replace` targets an entry that is not an
     /// `Apply`, and [`StateMachineError::ReplaceTargetNotInEffect`] if it targets an undone
     /// `Apply`. Returns [`StateMachineError::DuplicateId`] if `entry`'s id already appears in the
     /// log.
-    ///
-    /// # Panics
-    ///
-    /// Panics if healing the state after a failed `apply` (see [`Transition::apply`]'s
-    /// determinism contract) itself fails to replay. This indicates a `Transition` impl that
-    /// violates that contract, not a reachable failure under a correct one.
     pub fn apply(&mut self, entry: LogEntry<T>) -> Result<(), StateMachineError> {
         if self.index_of.contains_key(&entry.id()) {
             return Err(StateMachineError::DuplicateId(entry.id()));
         }
         match entry.kind() {
-            LogEntryKind::Apply(transition) => match transition.check_applicable(&self.current) {
-                Ok(()) => match transition.apply(&mut self.current) {
-                    Ok(()) => {
-                        self.index_of.insert(entry.id(), self.log.len());
-                        self.log.push(entry);
-                        self.push_effect();
-                        Ok(())
-                    }
-                    Err(err) => {
-                        // we need to replay the state
-                        // the log and its effects are exactly what they were before this call,
-                        // and that already replayed cleanly to produce the old `current`, so
-                        // re-replaying it here cannot fail.
-                        self.current = Self::replay(&self.log, &self.effects)
-                            .expect("previously-active entries must still replay");
-                        Err(StateMachineError::Transition(entry.id(), err))
-                    }
-                },
-                Err(err) => Err(StateMachineError::Transition(entry.id(), err)),
-            },
+            LogEntryKind::Apply(transition) => {
+                transition
+                    .check_applicable(&self.current)
+                    .map_err(|err| StateMachineError::Transition(entry.id(), err))?;
+                transition.apply(&mut self.current);
+                self.index_of.insert(entry.id(), self.log.len());
+                self.log.push(entry);
+                self.push_effect();
+                Ok(())
+            }
             LogEntryKind::Undo(target) => {
                 check_target(&self.index_of, *target, self.log.len())?;
                 self.push_and_replay(entry)
@@ -524,6 +572,52 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
                 self.push_and_replay(entry)
             }
         }
+    }
+
+    /// Applies `transition` as a new [`LogEntryKind::Apply`] with a fresh [`TransitionId`], see
+    /// [`Self::apply`], and returns that id, which a later `Undo` or `Replace` can target.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use undoable_state_machine::{
+    ///     LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition, TransitionError,
+    ///     TransitionId,
+    /// };
+    ///
+    /// struct Add(i64);
+    ///
+    /// impl Transition<i64> for Add {
+    ///     fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     fn apply(&self, state: &mut i64) {
+    ///         *state += self.0;
+    ///     }
+    /// }
+    ///
+    /// let mut sm = StateMachine::<i64, Add>::new();
+    /// let add_5 = sm.apply_new(Add(5))?;
+    /// sm.apply_new(Add(3))?;
+    /// assert_eq!(*sm.current(), 8);
+    ///
+    /// sm.apply(LogEntry::new(
+    ///     TransitionId::new(),
+    ///     LogEntryKind::Undo(add_5),
+    /// ))?;
+    /// assert_eq!(*sm.current(), 3);
+    /// # Ok::<(), StateMachineError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateMachineError::Transition`] if `transition` is not applicable to
+    /// [`Self::current`], in which case the log and [`Self::current`] are left unchanged.
+    pub fn apply_new(&mut self, transition: T) -> Result<TransitionId, StateMachineError> {
+        let id = TransitionId::new();
+        self.apply(LogEntry::new(id, LogEntryKind::Apply(transition)))?;
+        Ok(id)
     }
 
     /// Appends `entry`, an `Undo` or `Replace` whose target is checked already, and replays the log
@@ -555,8 +649,8 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// # Errors
     ///
     /// Returns [`StateMachineError::Transition`] if any active transition's
-    /// [`Transition::check_applicable`] or [`Transition::apply`] fails. A failing replacement is
-    /// reported with the id of its `Replace`.
+    /// [`Transition::check_applicable`] fails. A failing replacement is reported with the id of
+    /// its `Replace`.
     fn replay(log: &[LogEntry<T>], effects: &[EntryEffect]) -> Result<S, StateMachineError> {
         // transitions don't commute in general, they have to be applied in log order
         let active = (0..log.len()).filter_map(|index| transition_running_at(log, effects, index));
@@ -566,9 +660,7 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
             transition
                 .check_applicable(&state)
                 .map_err(|err| StateMachineError::Transition(id, err))?;
-            transition
-                .apply(&mut state)
-                .map_err(|err| StateMachineError::Transition(id, err))?;
+            transition.apply(&mut state);
         }
 
         Ok(state)

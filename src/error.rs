@@ -9,7 +9,8 @@ use crate::{TransitionError, TransitionId};
 /// An error from [`StateMachine::apply`] or [`StateMachine::build`].
 #[derive(Debug)]
 pub enum StateMachineError {
-    /// A transition returned an error
+    /// The transition of the entry with the given id is not applicable, see
+    /// [`Transition::check_applicable`](crate::Transition::check_applicable).
     Transition(TransitionId, TransitionError),
     /// An `Undo` or `Replace` targeted an id not present anywhere earlier in the log.
     UnknownTarget(TransitionId),

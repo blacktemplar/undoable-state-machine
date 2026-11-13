@@ -38,17 +38,16 @@ impl Transition<i64> for Add {
         Ok(())
     }
 
-    fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+    fn apply(&self, state: &mut i64) {
         *state += self.0;
-        Ok(())
     }
 }
 
 let mut sm = StateMachine::<i64, Box<dyn Transition<i64>>>::new();
 
-let first_id = TransitionId::new();
-sm.apply(LogEntry::new(first_id, LogEntryKind::Apply(Box::new(Add(5)))))?;
-sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(3)))))?;
+// `apply_new` appends a transition with a fresh id, and returns that id
+let first_id = sm.apply_new(Box::new(Add(5)))?;
+sm.apply_new(Box::new(Add(3)))?;
 assert_eq!(*sm.current(), 8);
 
 // Undo the first transition, the second transition survives on top of the new active set.
@@ -66,6 +65,15 @@ assert_eq!(*restored.current(), 3);
 # Ok::<(), StateMachineError>(())
 ```
 
+## Cost
+
+The design favours simplicity over speed of undo. Applying a transition runs it once, on the
+current state. Every undo and every replacement, though, replays all transitions in effect from
+the default state, and every undo also works out again which entries of the whole log are in
+effect, so each costs time linear in the length of the log, plus whatever the transitions
+themselves cost. `StateMachine::build` replays a log once. That is fine for logs of the size
+people build by hand, but makes undo slower the longer the log grows.
+
 ## Serialization
 
 The `serde` feature implements `Serialize`/`Deserialize` for `TransitionId`, `LogEntry`,
@@ -73,7 +81,7 @@ The `serde` feature implements `Serialize`/`Deserialize` for `TransitionId`, `Lo
 
 ```toml
 [dependencies]
-undoable-state-machine = { version = "0.1", features = ["serde"] }
+undoable-state-machine = { version = "0.3", features = ["serde"] }
 ```
 
 A whole log persists, undo entries included, so a restored state machine can still undo (and

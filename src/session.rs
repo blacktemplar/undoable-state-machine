@@ -1,6 +1,9 @@
 //! Undo and redo of the changes of one session to a [`StateMachine`] that other sessions append
 //! to as well.
 
+#[cfg(test)]
+mod tests;
+
 use std::{error::Error, fmt};
 
 use crate::{LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition, TransitionId};
@@ -29,10 +32,7 @@ use crate::{LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition,
 /// # Examples
 ///
 /// ```
-/// use undoable_state_machine::{
-///     LogEntry, LogEntryKind, SessionHistory, StateMachine, Transition, TransitionError,
-///     TransitionId,
-/// };
+/// use undoable_state_machine::{SessionHistory, StateMachine, Transition, TransitionError};
 ///
 /// struct Add(i64);
 ///
@@ -41,23 +41,16 @@ use crate::{LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition,
 ///         Ok(())
 ///     }
 ///
-///     fn apply(&self, state: &mut i64) -> Result<(), TransitionError> {
+///     fn apply(&self, state: &mut i64) {
 ///         *state += self.0;
-///         Ok(())
 ///     }
 /// }
 ///
 /// let mut sm = StateMachine::<i64, Add>::new();
 /// let mut history = SessionHistory::new();
-/// history.apply(
-///     &mut sm,
-///     LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Add(5))),
-/// )?;
+/// history.apply_new(&mut sm, Add(5))?;
 /// // a change of another session, e.g. pulled in by a sync
-/// sm.apply(LogEntry::new(
-///     TransitionId::new(),
-///     LogEntryKind::Apply(Add(100)),
-/// ))?;
+/// sm.apply_new(Add(100))?;
 ///
 /// // undoes the latest change of this session, not the latest one in the log
 /// history.undo_last(&mut sm)?;
@@ -98,6 +91,23 @@ impl SessionHistory {
         self.done.push(id);
         self.undone.clear();
         Ok(())
+    }
+
+    /// Applies `transition` to `machine` as a new [`LogEntryKind::Apply`] with a fresh
+    /// [`TransitionId`], see [`StateMachine::apply_new`], as an action of this session, which
+    /// leaves nothing to redo. Returns the id of the entry.
+    ///
+    /// # Errors
+    /// Returns the error of [`StateMachine::apply_new`], in which case neither the log nor the
+    /// history changes.
+    pub fn apply_new<S: Default, T: Transition<S>>(
+        &mut self,
+        machine: &mut StateMachine<S, T>,
+        transition: T,
+    ) -> Result<TransitionId, StateMachineError> {
+        let id = TransitionId::new();
+        self.apply(machine, LogEntry::new(id, LogEntryKind::Apply(transition)))?;
+        Ok(id)
     }
 
     /// The id of the entry of the action [`Self::undo_last`] undoes next, unless another session
@@ -263,310 +273,5 @@ impl Error for RedoLastError {
             RedoLastError::NothingToRedo | RedoLastError::RedoneElsewhere => None,
             RedoLastError::Rejected(error) => error.source(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_util::{
-        I64Transition, RequireAtLeast, StringTransition, apply_entry, apply_get_id, push_entry,
-        replace_push_entry,
-    };
-
-    /// Pushes `c` as an action of `history`, and returns the id of its entry.
-    fn push_in(
-        history: &mut SessionHistory,
-        sm: &mut StateMachine<String, StringTransition>,
-        c: char,
-    ) -> TransitionId {
-        let entry = push_entry(c);
-        let id = entry.id();
-        history.apply(sm, entry).unwrap();
-        id
-    }
-
-    #[test]
-    fn a_session_undoes_and_redoes_its_actions_in_order() {
-        let mut sm = StateMachine::<String, StringTransition>::new();
-        let mut history = SessionHistory::new();
-        for c in ['a', 'b', 'c'] {
-            push_in(&mut history, &mut sm, c);
-        }
-
-        history.undo_last(&mut sm).unwrap();
-        history.undo_last(&mut sm).unwrap();
-        assert_eq!(sm.current(), "a");
-        history.redo_last(&mut sm).unwrap();
-        assert_eq!(sm.current(), "ab");
-        history.undo_last(&mut sm).unwrap();
-        history.undo_last(&mut sm).unwrap();
-        assert_eq!(sm.current(), "");
-
-        assert!(matches!(
-            history.undo_last(&mut sm),
-            Err(UndoLastError::NothingToUndo)
-        ));
-        for expected in ["a", "ab", "abc"] {
-            history.redo_last(&mut sm).unwrap();
-            assert_eq!(sm.current(), expected);
-        }
-        assert!(matches!(
-            history.redo_last(&mut sm),
-            Err(RedoLastError::NothingToRedo)
-        ));
-    }
-
-    #[test]
-    fn a_new_action_leaves_nothing_to_redo() {
-        let mut sm = StateMachine::<String, StringTransition>::new();
-        let mut history = SessionHistory::new();
-        push_in(&mut history, &mut sm, 'a');
-        history.undo_last(&mut sm).unwrap();
-
-        push_in(&mut history, &mut sm, 'b');
-
-        assert!(matches!(
-            history.redo_last(&mut sm),
-            Err(RedoLastError::NothingToRedo)
-        ));
-        assert_eq!(sm.current(), "b");
-    }
-
-    #[test]
-    fn a_session_undoes_its_own_actions_rather_than_those_of_another_session() {
-        let mut sm = StateMachine::<String, StringTransition>::new();
-        let mut history = SessionHistory::new();
-        push_in(&mut history, &mut sm, 'a');
-        sm.apply(push_entry('b')).unwrap();
-
-        history.undo_last(&mut sm).unwrap();
-
-        assert_eq!(sm.current(), "b");
-        assert!(matches!(
-            history.undo_last(&mut sm),
-            Err(UndoLastError::NothingToUndo)
-        ));
-    }
-
-    /// An undo targeting an entry of the session's choice is an action like any other, so undoing
-    /// it brings back what it undid.
-    #[test]
-    fn undoing_a_targeted_undo_brings_back_what_it_undid() {
-        let mut sm = StateMachine::<String, StringTransition>::new();
-        let mut history = SessionHistory::new();
-        let a = push_in(&mut history, &mut sm, 'a');
-        push_in(&mut history, &mut sm, 'b');
-        history
-            .apply(
-                &mut sm,
-                LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a)),
-            )
-            .unwrap();
-        assert_eq!(sm.current(), "b");
-
-        history.undo_last(&mut sm).unwrap();
-
-        assert_eq!(sm.current(), "ab");
-        history.undo_last(&mut sm).unwrap();
-        assert_eq!(sm.current(), "a");
-    }
-
-    #[test]
-    fn undoing_a_replacement_brings_back_the_replaced_transition() {
-        let mut sm = StateMachine::<String, StringTransition>::new();
-        let mut history = SessionHistory::new();
-        let a = push_in(&mut history, &mut sm, 'a');
-        push_in(&mut history, &mut sm, 'b');
-        history.apply(&mut sm, replace_push_entry(a, 'x')).unwrap();
-        assert_eq!(sm.current(), "xb");
-
-        history.undo_last(&mut sm).unwrap();
-
-        assert_eq!(sm.current(), "ab");
-    }
-
-    /// An action another session undid is not passed over, which would undo an older action while
-    /// a newer one could still come back, e.g. if the other session undoes its undo.
-    #[test]
-    fn an_action_another_session_undid_is_not_offered_until_it_is_back() {
-        let mut sm = StateMachine::<String, StringTransition>::new();
-        let mut history = SessionHistory::new();
-        push_in(&mut history, &mut sm, 'a');
-        let b = push_in(&mut history, &mut sm, 'b');
-        let elsewhere = apply_get_id(
-            &mut sm,
-            LogEntry::new(TransitionId::new(), LogEntryKind::Undo(b)),
-        );
-
-        assert_eq!(history.next_undo(&sm), None);
-
-        sm.apply(LogEntry::new(
-            TransitionId::new(),
-            LogEntryKind::Undo(elsewhere),
-        ))
-        .unwrap();
-        assert_eq!(history.next_undo(&sm), Some(b));
-        history.undo_last(&mut sm).unwrap();
-        assert_eq!(sm.current(), "a");
-    }
-
-    #[test]
-    fn undoing_an_action_another_session_undid_leaves_nothing_to_undo_but_keeps_what_to_redo() {
-        let mut sm = StateMachine::<String, StringTransition>::new();
-        let mut history = SessionHistory::new();
-        push_in(&mut history, &mut sm, 'a');
-        let b = push_in(&mut history, &mut sm, 'b');
-        let c = push_in(&mut history, &mut sm, 'c');
-        history.undo_last(&mut sm).unwrap();
-        sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Undo(b)))
-            .unwrap();
-        let log_len = sm.log().len();
-
-        assert!(matches!(
-            history.undo_last(&mut sm),
-            Err(UndoLastError::UndoneElsewhere)
-        ));
-
-        assert_eq!(sm.log().len(), log_len);
-        assert_eq!(sm.current(), "a");
-        assert!(matches!(
-            history.undo_last(&mut sm),
-            Err(UndoLastError::NothingToUndo)
-        ));
-        assert_eq!(history.next_redo(&sm), Some(c));
-        history.redo_last(&mut sm).unwrap();
-        assert_eq!(sm.current(), "ac");
-    }
-
-    #[test]
-    fn redoing_an_action_another_session_redid_leaves_nothing_to_redo_but_keeps_what_to_undo() {
-        let mut sm = StateMachine::<String, StringTransition>::new();
-        let mut history = SessionHistory::new();
-        let a = push_in(&mut history, &mut sm, 'a');
-        push_in(&mut history, &mut sm, 'b');
-        push_in(&mut history, &mut sm, 'c');
-        history.undo_last(&mut sm).unwrap();
-        let undo = history.undo_last(&mut sm).unwrap();
-        sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo)))
-            .unwrap();
-        let log_len = sm.log().len();
-        assert_eq!(history.next_redo(&sm), None);
-
-        assert!(matches!(
-            history.redo_last(&mut sm),
-            Err(RedoLastError::RedoneElsewhere)
-        ));
-
-        assert_eq!(sm.log().len(), log_len);
-        assert_eq!(sm.current(), "ab");
-        assert!(matches!(
-            history.redo_last(&mut sm),
-            Err(RedoLastError::NothingToRedo)
-        ));
-        assert_eq!(history.next_undo(&sm), Some(a));
-        history.undo_last(&mut sm).unwrap();
-        assert_eq!(sm.current(), "b");
-    }
-
-    /// Entries of other sessions are no actions of this one, so they leave what it undid to redo.
-    #[test]
-    fn an_entry_of_another_session_leaves_what_to_redo() {
-        let mut sm = StateMachine::<String, StringTransition>::new();
-        let mut history = SessionHistory::new();
-        let a = push_in(&mut history, &mut sm, 'a');
-        history.undo_last(&mut sm).unwrap();
-
-        sm.apply(push_entry('b')).unwrap();
-
-        assert_eq!(history.next_redo(&sm), Some(a));
-        history.redo_last(&mut sm).unwrap();
-        assert_eq!(sm.current(), "ab");
-    }
-
-    /// An action the session undid itself, by an undo targeting it, lies below that undo, so it is
-    /// in effect again by the time it is the latest action.
-    #[test]
-    fn an_action_the_session_undid_itself_is_undone_after_that_undo() {
-        let mut sm = StateMachine::<String, StringTransition>::new();
-        let mut history = SessionHistory::new();
-        let a = push_in(&mut history, &mut sm, 'a');
-        history
-            .apply(
-                &mut sm,
-                LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a)),
-            )
-            .unwrap();
-        assert_eq!(sm.current(), "");
-
-        history.undo_last(&mut sm).unwrap();
-        assert_eq!(sm.current(), "a");
-        history.undo_last(&mut sm).unwrap();
-
-        assert_eq!(sm.current(), "");
-        assert!(matches!(
-            history.undo_last(&mut sm),
-            Err(UndoLastError::NothingToUndo)
-        ));
-    }
-
-    #[test]
-    fn an_undo_an_entry_of_another_session_depends_on_is_rejected_and_leaves_nothing_to_undo() {
-        let mut sm = StateMachine::<i64, I64Transition>::new();
-        let mut history = SessionHistory::new();
-        history.apply(&mut sm, apply_entry(5)).unwrap();
-        sm.apply(LogEntry::new(
-            TransitionId::new(),
-            LogEntryKind::Apply(Box::new(RequireAtLeast(5))),
-        ))
-        .unwrap();
-        let log_len = sm.log().len();
-
-        let result = history.undo_last(&mut sm);
-
-        assert!(matches!(result, Err(UndoLastError::Rejected(_))));
-        assert_eq!(sm.log().len(), log_len);
-        assert_eq!(*sm.current(), 5);
-        assert!(matches!(
-            history.undo_last(&mut sm),
-            Err(UndoLastError::NothingToUndo)
-        ));
-    }
-
-    #[test]
-    fn a_redo_that_no_longer_applies_is_rejected_and_leaves_nothing_to_redo() {
-        let mut sm = StateMachine::<i64, I64Transition>::new();
-        let mut history = SessionHistory::new();
-        let first = apply_entry(1);
-        let first_id = first.id();
-        history.apply(&mut sm, first).unwrap();
-        let elsewhere = apply_get_id(&mut sm, apply_entry(5));
-        history
-            .apply(
-                &mut sm,
-                LogEntry::new(
-                    TransitionId::new(),
-                    LogEntryKind::Apply(Box::new(RequireAtLeast(6))),
-                ),
-            )
-            .unwrap();
-        history.undo_last(&mut sm).unwrap();
-        sm.apply(LogEntry::new(
-            TransitionId::new(),
-            LogEntryKind::Undo(elsewhere),
-        ))
-        .unwrap();
-        let log_len = sm.log().len();
-
-        let result = history.redo_last(&mut sm);
-
-        assert!(matches!(result, Err(RedoLastError::Rejected(_))));
-        assert_eq!(sm.log().len(), log_len);
-        assert_eq!(*sm.current(), 1);
-        assert!(matches!(
-            history.redo_last(&mut sm),
-            Err(RedoLastError::NothingToRedo)
-        ));
-        assert_eq!(history.next_undo(&sm), Some(first_id));
     }
 }

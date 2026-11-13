@@ -1,6 +1,6 @@
 [package]
 name = "undoable-state-machine"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A generic, undoable state machine backed by an append-only log, where undo is just another log entry."
