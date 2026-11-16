@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-16
+
+### Added
+
+- `SessionHistory::apply_all`: applies several entries as one action of the session, which
+  `undo_last` undoes and `redo_last` redoes as a whole. If one of them is rejected, those applied
+  before it are undone again, so the state and the history are as before. Logs are unaffected:
+  which entries form an action is not part of the log.
+
+### Changed
+
+- **Breaking:** an action of a `SessionHistory` is a group of entries. `undo_last` and
+  `redo_last` return the ids of every entry they append (`Vec<TransitionId>`), and `next_undo`
+  and `next_redo` the ids of the entries of the action (`Option<&[TransitionId]>`), `None` if
+  another session has undone or redone any of them. An undo or redo rejected part of the way
+  through an action of several entries leaves the entries appended before in the log, and ends
+  the history as any failed undo or redo does.
+
 ## [0.3.0] - 2026-11-13
 
 ### Added

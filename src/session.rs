@@ -14,20 +14,23 @@ use crate::{LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition,
 ///
 /// Every entry the session appends through [`Self::apply`] is one of its actions, whatever its
 /// kind: an undo targeting an entry of its choice, such as the change of another session, or a
-/// replacement is an action as well. [`Self::undo_last`] undoes the latest action of the session
-/// and [`Self::redo_last`] redoes the action it undid last, each by appending a
-/// [`LogEntryKind::Undo`] naming its target, so that the log means the same however it is merged
-/// with the logs of other sessions. A new action leaves nothing to redo; the entries of other
-/// sessions change neither what there is to undo nor to redo.
+/// replacement is an action as well. [`Self::apply_all`] appends several entries as one action,
+/// which is undone and redone as a whole. [`Self::undo_last`] undoes the latest action of the
+/// session and [`Self::redo_last`] redoes the action it undid last, each by appending a
+/// [`LogEntryKind::Undo`] per entry of the action naming that entry as its target, so that the log
+/// means the same however it is merged with the logs of other sessions. A new action leaves
+/// nothing to redo; the entries of other sessions change neither what there is to undo nor to
+/// redo.
 ///
-/// Only an entry of another session can make undoing or redoing fail: one that undid the action to
-/// undo, or the undo of the action to redo, or one that does not apply without the action, or with
-/// it. Then the history ends there: a failed undo leaves nothing to undo, a failed redo nothing to
-/// redo, rather than passing over the action. [`Self::next_undo`] and [`Self::next_redo`] tell
-/// beforehand what has been undone or redone elsewhere.
+/// Only an entry of another session can make undoing or redoing fail: one that undid an entry of
+/// the action to undo, or one of the undos of the action to redo, or one that does not apply
+/// without the action, or with it. Then the history ends there: a failed undo leaves nothing to
+/// undo, a failed redo nothing to redo, rather than passing over the action. [`Self::next_undo`]
+/// and [`Self::next_redo`] tell beforehand what has been undone or redone elsewhere.
 ///
 /// The history holds the ids of the entries alone, and is not part of the log: a log restored
-/// from somewhere else comes with no history, and a session ends with its history.
+/// from somewhere else comes with no history, and a session ends with its history. Which entries
+/// form one action is not in the log either.
 ///
 /// # Examples
 ///
@@ -61,11 +64,22 @@ use crate::{LogEntry, LogEntryKind, StateMachine, StateMachineError, Transition,
 /// ```
 #[derive(Debug, Default, Clone)]
 pub struct SessionHistory {
-    /// The actions of the session that [`Self::undo_last`] has not undone, oldest first.
-    done: Vec<TransitionId>,
-    /// The actions [`Self::undo_last`] undid since the latest action, each with the undo entry
-    /// appended for it, the one undone last at the end.
-    undone: Vec<(TransitionId, TransitionId)>,
+    /// The actions of the session that [`Self::undo_last`] has not undone, oldest first, each as
+    /// the ids of its entries, oldest first, never none.
+    done: Vec<Vec<TransitionId>>,
+    /// The actions [`Self::undo_last`] undid since the latest action, the one undone last at the
+    /// end.
+    undone: Vec<UndoneAction>,
+}
+
+/// An action of a [`SessionHistory`] that [`SessionHistory::undo_last`] undid.
+#[derive(Debug, Clone)]
+struct UndoneAction {
+    /// The ids of the entries of the action, oldest first, never none.
+    entries: Vec<TransitionId>,
+    /// The ids of the undo entries appended for them, in the order appended, i.e. the undo of the
+    /// newest entry first.
+    undos: Vec<TransitionId>,
 }
 
 impl SessionHistory {
@@ -88,8 +102,81 @@ impl SessionHistory {
     ) -> Result<(), StateMachineError> {
         let id = entry.id();
         machine.apply(entry)?;
-        self.done.push(id);
-        self.undone.clear();
+        self.push_action(vec![id]);
+        Ok(())
+    }
+
+    /// Applies `entries` to `machine` in order, see [`StateMachine::apply`], as **one** action of
+    /// this session, which leaves nothing to redo: [`Self::undo_last`] undoes them together, and
+    /// [`Self::redo_last`] redoes them together. Without entries, nothing happens, and there is
+    /// no action.
+    ///
+    /// # Errors
+    /// Returns the error of [`StateMachine::apply`] for the first entry it rejects. Then the
+    /// entries applied before that one are undone again, by appending an undo of each, newest
+    /// first, so that the state is as before and the history unchanged; the log keeps the
+    /// entries and their undos. The entries after the rejected one are not applied.
+    ///
+    /// # Panics
+    /// Panics if undoing an entry applied before the rejected one is rejected, which cannot
+    /// happen as long as [`Transition::apply`] is deterministic, as it must be: every undo
+    /// returns to a state the log was in before.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use undoable_state_machine::{
+    ///     LogEntry, LogEntryKind, SessionHistory, StateMachine, Transition, TransitionError,
+    ///     TransitionId,
+    /// };
+    ///
+    /// struct Add(i64);
+    ///
+    /// impl Transition<i64> for Add {
+    ///     fn check_applicable(&self, _state: &i64) -> Result<(), TransitionError> {
+    ///         Ok(())
+    ///     }
+    ///
+    ///     fn apply(&self, state: &mut i64) {
+    ///         *state += self.0;
+    ///     }
+    /// }
+    ///
+    /// let mut sm = StateMachine::<i64, Add>::new();
+    /// let mut history = SessionHistory::new();
+    /// history.apply_all(
+    ///     &mut sm,
+    ///     [1, 2, 3].map(|n| LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Add(n)))),
+    /// )?;
+    /// assert_eq!(*sm.current(), 6);
+    ///
+    /// assert_eq!(history.undo_last(&mut sm)?.len(), 3);
+    /// assert_eq!(*sm.current(), 0);
+    /// history.redo_last(&mut sm)?;
+    /// assert_eq!(*sm.current(), 6);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn apply_all<S: Default, T: Transition<S>>(
+        &mut self,
+        machine: &mut StateMachine<S, T>,
+        entries: impl IntoIterator<Item = LogEntry<T>>,
+    ) -> Result<(), StateMachineError> {
+        let mut applied = Vec::new();
+        for entry in entries {
+            let id = entry.id();
+            if let Err(error) = machine.apply(entry) {
+                for &id in applied.iter().rev() {
+                    machine
+                        .apply(LogEntry::new(TransitionId::new(), LogEntryKind::Undo(id)))
+                        .expect("undoing the latest entry in effect returns to an earlier state");
+                }
+                return Err(error);
+            }
+            applied.push(id);
+        }
+        if !applied.is_empty() {
+            self.push_action(applied);
+        }
         Ok(())
     }
 
@@ -110,92 +197,135 @@ impl SessionHistory {
         Ok(id)
     }
 
-    /// The id of the entry of the action [`Self::undo_last`] undoes next, unless another session
-    /// has undone it already. `None` if there is nothing to undo.
+    /// Records the entries with the ids `entries`, just appended, as an action.
+    fn push_action(&mut self, entries: Vec<TransitionId>) {
+        self.done.push(entries);
+        self.undone.clear();
+    }
+
+    /// The ids of the entries of the action [`Self::undo_last`] undoes next, oldest first, unless
+    /// another session has undone any of them already. `None` if there is nothing to undo.
     ///
     /// The undo may still be rejected, if an entry in effect does not apply without the action:
     /// finding that out replays the log, as undoing does.
     #[must_use]
-    pub fn next_undo<S, T>(&self, machine: &StateMachine<S, T>) -> Option<TransitionId> {
-        // an action of the session undone by another action of the session lies below that one,
-        // which is undone first, so the latest action is only out of effect if another session
-        // undid it
-        let &action = self.done.last()?;
-        (machine.is_in_effect(action) == Some(true)).then_some(action)
+    pub fn next_undo<S, T>(&self, machine: &StateMachine<S, T>) -> Option<&[TransitionId]> {
+        let action = self.done.last()?;
+        is_undoable(action, machine).then_some(action.as_slice())
     }
 
-    /// The id of the entry of the action [`Self::redo_last`] redoes next, unless another session
-    /// has redone it already. `None` if there is nothing to redo.
+    /// The ids of the entries of the action [`Self::redo_last`] redoes next, oldest first, unless
+    /// another session has redone any of them already. `None` if there is nothing to redo.
     ///
     /// The redo may still be rejected, if the action does not apply together with the entries in
     /// effect.
     #[must_use]
-    pub fn next_redo<S, T>(&self, machine: &StateMachine<S, T>) -> Option<TransitionId> {
-        let &(action, undo) = self.undone.last()?;
-        (machine.is_in_effect(undo) == Some(true)).then_some(action)
+    pub fn next_redo<S, T>(&self, machine: &StateMachine<S, T>) -> Option<&[TransitionId]> {
+        let action = self.undone.last()?;
+        is_redoable(action, machine).then_some(action.entries.as_slice())
     }
 
-    /// Undoes the latest action of this session that [`Self::undo_last`] has not undone, and
-    /// returns the id of the undo entry appended for that.
+    /// Undoes the latest action of this session that [`Self::undo_last`] has not undone, by
+    /// appending an undo of each of its entries, newest first, and returns the ids of the undo
+    /// entries appended, in that order.
     ///
     /// As long as only this session appends to the log, undoing its actions one after another
     /// returns to the states the log was in before them, which cannot fail.
     ///
     /// # Errors
     /// Returns [`UndoLastError::NothingToUndo`] if the session has no such action,
-    /// [`UndoLastError::UndoneElsewhere`] if another session has undone it, and
-    /// [`UndoLastError::Rejected`] if an entry in effect does not apply without it, see
-    /// [`StateMachine::apply`]. The log does not change, and in the last two cases the session is
-    /// left with nothing to undo; what it can redo stays.
+    /// [`UndoLastError::UndoneElsewhere`] if another session has undone any of its entries, see
+    /// [`Self::next_undo`], and [`UndoLastError::Rejected`] if an entry in effect does not apply
+    /// without one of them, see [`StateMachine::apply`]. In the last two cases the session is
+    /// left with nothing to undo; what it can redo stays. The log does not change, except when an
+    /// undo is rejected part of the way through an action of several entries: the undos appended
+    /// before stay in the log, so those entries stay undone, and the action cannot be redone
+    /// through the history.
     pub fn undo_last<S: Default, T: Transition<S>>(
         &mut self,
         machine: &mut StateMachine<S, T>,
-    ) -> Result<TransitionId, UndoLastError> {
-        if self.done.is_empty() {
-            return Err(UndoLastError::NothingToUndo);
-        }
-        let Some(action) = self.next_undo(machine) else {
+    ) -> Result<Vec<TransitionId>, UndoLastError> {
+        let entries = self.done.pop().ok_or(UndoLastError::NothingToUndo)?;
+        if !is_undoable(&entries, machine) {
             self.done.clear();
             return Err(UndoLastError::UndoneElsewhere);
-        };
-        let id = TransitionId::new();
-        if let Err(error) = machine.apply(LogEntry::new(id, LogEntryKind::Undo(action))) {
-            self.done.clear();
-            return Err(UndoLastError::Rejected(error));
         }
-        self.done.pop();
-        self.undone.push((action, id));
-        Ok(id)
+        let mut undos = Vec::with_capacity(entries.len());
+        for &entry in entries.iter().rev() {
+            let id = TransitionId::new();
+            if let Err(error) = machine.apply(LogEntry::new(id, LogEntryKind::Undo(entry))) {
+                self.done.clear();
+                return Err(UndoLastError::Rejected(error));
+            }
+            undos.push(id);
+        }
+        self.undone.push(UndoneAction {
+            entries,
+            undos: undos.clone(),
+        });
+        Ok(undos)
     }
 
     /// Redoes the action of this session that [`Self::undo_last`] undid last, as long as the
-    /// session took no new action since, by undoing that undo, and returns the id of the entry
-    /// appended for that.
+    /// session took no new action since, by undoing the undo of each of its entries, oldest
+    /// first, and returns the ids of the entries appended for that, in that order.
     ///
     /// # Errors
     /// Returns [`RedoLastError::NothingToRedo`] if there is no such action,
-    /// [`RedoLastError::RedoneElsewhere`] if another session has undone the undo already, and
-    /// [`RedoLastError::Rejected`] if the action does not apply together with the entries in
-    /// effect, see [`StateMachine::apply`]. The log does not change, and in the last two cases the
-    /// session is left with nothing to redo; what it can undo stays.
+    /// [`RedoLastError::RedoneElsewhere`] if another session has undone any of the undos already,
+    /// see [`Self::next_redo`], and [`RedoLastError::Rejected`] if an entry of the action does
+    /// not apply together with the entries in effect, see [`StateMachine::apply`]. In the last
+    /// two cases the session is left with nothing to redo; what it can undo stays. The log does
+    /// not change, except when a redo is rejected part of the way through an action of several
+    /// entries: the entries appended before stay in the log, so the entries they redid stay in
+    /// effect, and the action cannot be undone through the history.
     pub fn redo_last<S: Default, T: Transition<S>>(
         &mut self,
         machine: &mut StateMachine<S, T>,
-    ) -> Result<TransitionId, RedoLastError> {
-        let &(action, undo) = self.undone.last().ok_or(RedoLastError::NothingToRedo)?;
-        if machine.is_in_effect(undo) != Some(true) {
+    ) -> Result<Vec<TransitionId>, RedoLastError> {
+        let action = self.undone.pop().ok_or(RedoLastError::NothingToRedo)?;
+        if !is_redoable(&action, machine) {
             self.undone.clear();
             return Err(RedoLastError::RedoneElsewhere);
         }
-        let id = TransitionId::new();
-        if let Err(error) = machine.apply(LogEntry::new(id, LogEntryKind::Undo(undo))) {
-            self.undone.clear();
-            return Err(RedoLastError::Rejected(error));
+        let mut appended = Vec::with_capacity(action.undos.len());
+        for &undo in action.undos.iter().rev() {
+            let id = TransitionId::new();
+            if let Err(error) = machine.apply(LogEntry::new(id, LogEntryKind::Undo(undo))) {
+                self.undone.clear();
+                return Err(RedoLastError::Rejected(error));
+            }
+            appended.push(id);
         }
-        self.undone.pop();
-        self.done.push(action);
-        Ok(id)
+        self.done.push(action.entries);
+        Ok(appended)
     }
+}
+
+/// Whether no other session has undone any of `entries`, the ids of the entries of the latest
+/// action of a session that it has not undone, oldest first.
+fn is_undoable<S, T>(entries: &[TransitionId], machine: &StateMachine<S, T>) -> bool {
+    // an action of the session undone by a later action of the session lies below that one, which
+    // is undone first, and an entry undone by a later entry of the same action is in effect again
+    // once undoing the action reaches it, so an entry is only out of effect for good if another
+    // session undid it
+    entries.iter().enumerate().all(|(index, &id)| {
+        machine.is_in_effect(id) == Some(true)
+            || entries[index + 1..].iter().any(|&later| {
+                matches!(
+                    machine.entry(later).map(LogEntry::kind),
+                    Some(&LogEntryKind::Undo(target)) if target == id
+                )
+            })
+    })
+}
+
+/// Whether no other session has undone any of the undos of `action`.
+fn is_redoable<S, T>(action: &UndoneAction, machine: &StateMachine<S, T>) -> bool {
+    action
+        .undos
+        .iter()
+        .all(|&undo| machine.is_in_effect(undo) == Some(true))
 }
 
 /// An error from [`SessionHistory::undo_last`].
@@ -203,9 +333,11 @@ impl SessionHistory {
 pub enum UndoLastError {
     /// The session has no action that is not undone.
     NothingToUndo,
-    /// Another session has undone the action to undo, so the history no longer matches the log.
+    /// Another session has undone an entry of the action to undo, so the history no longer
+    /// matches the log.
     UndoneElsewhere,
-    /// Undoing the action was rejected, because an entry in effect does not apply without it.
+    /// Undoing the action was rejected, because an entry in effect does not apply without it, or
+    /// without one of its entries.
     Rejected(StateMachineError),
 }
 
@@ -241,11 +373,11 @@ impl Error for UndoLastError {
 pub enum RedoLastError {
     /// The session undid no action since its latest one.
     NothingToRedo,
-    /// Another session has undone the undo of the action to redo, so the history no longer
-    /// matches the log.
+    /// Another session has undone an undo of the action to redo, so the history no longer matches
+    /// the log.
     RedoneElsewhere,
-    /// Redoing the action was rejected, because it does not apply together with the entries in
-    /// effect.
+    /// Redoing the action was rejected, because one of its entries does not apply together with
+    /// the entries in effect.
     Rejected(StateMachineError),
 }
 
