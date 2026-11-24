@@ -24,6 +24,11 @@ together are one change of the session, undone and redone as a whole.
 The crate has no notion of any particular domain: it is generic over the state type `S` and the
 transition type `T: Transition<S>`, and consumers supply their own.
 
+Every entry also carries metadata of a type `M` (`()` by default), whatever the consumer records
+about it, e.g. when it was appended. The state machine never reads it and never makes it up: every
+operation appending an entry, undo entries included, takes the metadata from the caller, and it
+plays no part in replaying.
+
 ## Example
 
 ```rust
@@ -47,19 +52,19 @@ impl Transition<i64> for Add {
 let mut sm = StateMachine::<i64, Box<dyn Transition<i64>>>::new();
 
 // `apply_new` appends a transition with a fresh id, and returns that id
-let first_id = sm.apply_new(Box::new(Add(5)))?;
-sm.apply_new(Box::new(Add(3)))?;
+let first_id = sm.apply_new(Box::new(Add(5)), ())?;
+sm.apply_new(Box::new(Add(3)), ())?;
 assert_eq!(*sm.current(), 8);
 
 // Undo the first transition, the second transition survives on top of the new active set.
-sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Undo(first_id)))?;
+sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Undo(first_id), ()))?;
 assert_eq!(*sm.current(), 3);
 
 // `StateMachine::build` reconstructs a state machine from a previously
 // recorded log, e.g. one persisted elsewhere.
 let persisted: Vec<LogEntry<Box<dyn Transition<i64>>>> = vec![
-    LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(1)))),
-    LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(2)))),
+    LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(1))), ()),
+    LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(2))), ()),
 ];
 let restored = StateMachine::<i64, Box<dyn Transition<i64>>>::build(persisted)?;
 assert_eq!(*restored.current(), 3);
@@ -82,14 +87,15 @@ The `serde` feature implements `Serialize`/`Deserialize` for `TransitionId`, `Lo
 
 ```toml
 [dependencies]
-undoable-state-machine = { version = "0.4", features = ["serde"] }
+undoable-state-machine = { version = "0.5", features = ["serde"] }
 ```
 
-A whole log persists, undo entries included, so a restored state machine can still undo (and
+A whole log persists, undo entries and the metadata of every entry included, so a restored state machine can still undo (and
 undo its undos). A `StateMachine` serializes as its log alone - `current()` is derived state and
 is recomputed by `build` on deserialization, which is also where a log that doesn't replay
 cleanly is rejected. See the `Serialize for StateMachine` impl for a full example.
 
-The log types are (de)serializable exactly when the transition type `T` is, which
+The log types are (de)serializable exactly when the transition type `T` and the metadata type
+`M` are, which
 `Box<dyn Transition<S>>` isn't: use an enum of the transitions, or a crate like
 [`typetag`](https://docs.rs/typetag), as `T` for a persistable log.

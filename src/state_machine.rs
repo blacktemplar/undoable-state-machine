@@ -12,8 +12,8 @@ use std::{collections::HashMap, fmt};
 use self::effects::{EntryEffect, compute_effects, transition_running_at};
 use crate::{LogEntry, LogEntryKind, StateMachineError, Transition, TransitionId};
 
-pub struct StateMachine<S, T> {
-    log: Vec<LogEntry<T>>,
+pub struct StateMachine<S, T, M = ()> {
+    log: Vec<LogEntry<T, M>>,
     /// The index in `log` of every id currently in it, kept in sync with it so id lookups
     /// (duplicate rejection, [`StateMachine::entry`]) are O(1) instead of a linear scan over a
     /// potentially long log.
@@ -25,7 +25,7 @@ pub struct StateMachine<S, T> {
     current: S,
 }
 
-impl<S: fmt::Debug, T: fmt::Debug> fmt::Debug for StateMachine<S, T> {
+impl<S: fmt::Debug, T: fmt::Debug, M: fmt::Debug> fmt::Debug for StateMachine<S, T, M> {
     // Omits the internal caches `index_of` and `effects`, which are derived from `log`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("StateMachine")
@@ -35,13 +35,13 @@ impl<S: fmt::Debug, T: fmt::Debug> fmt::Debug for StateMachine<S, T> {
     }
 }
 
-impl<S: Default, T> Default for StateMachine<S, T> {
+impl<S: Default, T, M> Default for StateMachine<S, T, M> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S, T> StateMachine<S, T> {
+impl<S, T, M> StateMachine<S, T, M> {
     /// Returns the current state: the result of replaying every log entry that is still active
     /// (i.e. not cancelled by a later, still-active [`LogEntryKind::Undo`]).
     pub fn current(&self) -> &S {
@@ -49,7 +49,7 @@ impl<S, T> StateMachine<S, T> {
     }
 
     /// Returns the full append-only log, including entries that have since been undone.
-    pub fn log(&self) -> &[LogEntry<T>] {
+    pub fn log(&self) -> &[LogEntry<T, M>] {
         &self.log
     }
 
@@ -78,8 +78,12 @@ impl<S, T> StateMachine<S, T> {
     ///
     /// let mut sm = StateMachine::<i64, Box<dyn Transition<i64>>>::new();
     /// let (add_5, undo_add_5) = (TransitionId::new(), TransitionId::new());
-    /// sm.apply(LogEntry::new(add_5, LogEntryKind::Apply(Box::new(Add(5)))))?;
-    /// sm.apply(LogEntry::new(undo_add_5, LogEntryKind::Undo(add_5)))?;
+    /// sm.apply(LogEntry::new(
+    ///     add_5,
+    ///     LogEntryKind::Apply(Box::new(Add(5))),
+    ///     (),
+    /// ))?;
+    /// sm.apply(LogEntry::new(undo_add_5, LogEntryKind::Undo(add_5), ()))?;
     ///
     /// // the undone entry is still found
     /// assert!(matches!(
@@ -89,7 +93,7 @@ impl<S, T> StateMachine<S, T> {
     /// assert!(sm.entry(TransitionId::new()).is_none());
     /// # Ok::<(), StateMachineError>(())
     /// ```
-    pub fn entry(&self, id: TransitionId) -> Option<&LogEntry<T>> {
+    pub fn entry(&self, id: TransitionId) -> Option<&LogEntry<T, M>> {
         self.index_of.get(&id).map(|&index| &self.log[index])
     }
 
@@ -123,7 +127,7 @@ impl<S, T> StateMachine<S, T> {
     ///
     /// let mut sm = StateMachine::<i64, Add>::new();
     /// let (add, replace) = (TransitionId::new(), TransitionId::new());
-    /// sm.apply(LogEntry::new(add, LogEntryKind::Apply(Add(5))))?;
+    /// sm.apply(LogEntry::new(add, LogEntryKind::Apply(Add(5)), ()))?;
     /// assert_eq!(sm.effective_transition(add), Some(&Add(5)));
     ///
     /// sm.apply(LogEntry::new(
@@ -132,13 +136,18 @@ impl<S, T> StateMachine<S, T> {
     ///         target: add,
     ///         with: Add(7),
     ///     },
+    ///     (),
     /// ))?;
     /// assert_eq!(sm.effective_transition(add), Some(&Add(7)));
     /// // only an `Apply` has an effective transition
     /// assert_eq!(sm.effective_transition(replace), None);
     ///
     /// // and only while it is in effect
-    /// sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Undo(add)))?;
+    /// sm.apply(LogEntry::new(
+    ///     TransitionId::new(),
+    ///     LogEntryKind::Undo(add),
+    ///     (),
+    /// ))?;
     /// assert_eq!(sm.effective_transition(add), None);
     /// # Ok::<(), StateMachineError>(())
     /// ```
@@ -185,16 +194,16 @@ impl<S, T> StateMachine<S, T> {
     ///     TransitionId::new(),
     /// );
     /// let log: Vec<LogEntry<Box<dyn Transition<i64>>>> = vec![
-    ///     LogEntry::new(add_5, LogEntryKind::Apply(Box::new(Add(5)))),
-    ///     LogEntry::new(add_7, LogEntryKind::Apply(Box::new(Add(7)))),
-    ///     LogEntry::new(undo_add_7, LogEntryKind::Undo(add_7)),
+    ///     LogEntry::new(add_5, LogEntryKind::Apply(Box::new(Add(5))), ()),
+    ///     LogEntry::new(add_7, LogEntryKind::Apply(Box::new(Add(7))), ()),
+    ///     LogEntry::new(undo_add_7, LogEntryKind::Undo(add_7), ()),
     /// ];
     /// let sm = StateMachine::build(log)?;
     /// let in_effect: Vec<_> = sm.rev_in_effect().map(LogEntry::id).collect();
     /// assert_eq!(in_effect, [undo_add_7, add_5]);
     /// # Ok::<(), StateMachineError>(())
     /// ```
-    pub fn rev_in_effect(&self) -> impl Iterator<Item = &LogEntry<T>> {
+    pub fn rev_in_effect(&self) -> impl Iterator<Item = &LogEntry<T, M>> {
         self.log
             .iter()
             .zip(&self.effects)
@@ -239,12 +248,13 @@ impl<S, T> StateMachine<S, T> {
     /// }
     ///
     /// let mut sm = StateMachine::<i64, Arith>::new();
-    /// let add_5 = sm.apply_new(Arith::Add(5))?;
-    /// let mul_2 = sm.apply_new(Arith::Mul(2))?;
-    /// let add_1 = sm.apply_new(Arith::Add(1))?;
+    /// let add_5 = sm.apply_new(Arith::Add(5), ())?;
+    /// let mul_2 = sm.apply_new(Arith::Mul(2), ())?;
+    /// let add_1 = sm.apply_new(Arith::Add(1), ())?;
     /// sm.apply(LogEntry::new(
     ///     TransitionId::new(),
     ///     LogEntryKind::Undo(add_1),
+    ///     (),
     /// ))?;
     /// sm.apply(LogEntry::new(
     ///     TransitionId::new(),
@@ -252,6 +262,7 @@ impl<S, T> StateMachine<S, T> {
     ///         target: mul_2,
     ///         with: Arith::Mul(3),
     ///     },
+    ///     (),
     /// ))?;
     ///
     /// let applied: Vec<_> = sm.rev_in_effect_applied().collect();
@@ -299,10 +310,10 @@ impl<S, T> StateMachine<S, T> {
     ///
     /// let mut sm = StateMachine::<i64, Add>::new();
     /// let (add, undo) = (TransitionId::new(), TransitionId::new());
-    /// sm.apply(LogEntry::new(add, LogEntryKind::Apply(Add(5))))?;
+    /// sm.apply(LogEntry::new(add, LogEntryKind::Apply(Add(5)), ()))?;
     /// assert_eq!(sm.is_in_effect(add), Some(true));
     ///
-    /// sm.apply(LogEntry::new(undo, LogEntryKind::Undo(add)))?;
+    /// sm.apply(LogEntry::new(undo, LogEntryKind::Undo(add), ()))?;
     /// assert_eq!(sm.is_in_effect(add), Some(false));
     /// assert_eq!(sm.is_in_effect(undo), Some(true));
     /// assert_eq!(sm.is_in_effect(TransitionId::new()), None);
@@ -360,8 +371,8 @@ fn check_target(
 
 /// Checks that `target`, the target of a [`LogEntryKind::Replace`] at index `replace_index` of
 /// `log`, is an [`LogEntryKind::Apply`] before it. Returns `target`'s index on success.
-fn check_replace_target<T>(
-    log: &[LogEntry<T>],
+fn check_replace_target<T, M>(
+    log: &[LogEntry<T, M>],
     index_of: &HashMap<TransitionId, usize>,
     target: TransitionId,
     replace_index: usize,
@@ -375,7 +386,7 @@ fn check_replace_target<T>(
     }
 }
 
-impl<S: Default, T> StateMachine<S, T> {
+impl<S: Default, T, M> StateMachine<S, T, M> {
     /// Creates an empty state machine with `S::default()` as the current state and no log
     /// entries.
     ///
@@ -401,7 +412,7 @@ impl<S: Default, T> StateMachine<S, T> {
     }
 }
 
-impl<S: Default, T: Transition<S>> StateMachine<S, T> {
+impl<S: Default, T: Transition<S>, M> StateMachine<S, T, M> {
     /// Reconstructs a state machine from a previously recorded log, e.g. one persisted elsewhere
     /// or merged from multiple sources.
     ///
@@ -434,10 +445,26 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     ///
     /// let add_7_transition_id = TransitionId::new();
     /// let log: Vec<LogEntry<Box<dyn Transition<i64>>>> = vec![
-    ///     LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(5)))),
-    ///     LogEntry::new(add_7_transition_id, LogEntryKind::Apply(Box::new(Add(7)))),
-    ///     LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(-3)))),
-    ///     LogEntry::new(TransitionId::new(), LogEntryKind::Undo(add_7_transition_id)),
+    ///     LogEntry::new(
+    ///         TransitionId::new(),
+    ///         LogEntryKind::Apply(Box::new(Add(5))),
+    ///         (),
+    ///     ),
+    ///     LogEntry::new(
+    ///         add_7_transition_id,
+    ///         LogEntryKind::Apply(Box::new(Add(7))),
+    ///         (),
+    ///     ),
+    ///     LogEntry::new(
+    ///         TransitionId::new(),
+    ///         LogEntryKind::Apply(Box::new(Add(-3))),
+    ///         (),
+    ///     ),
+    ///     LogEntry::new(
+    ///         TransitionId::new(),
+    ///         LogEntryKind::Undo(add_7_transition_id),
+    ///         (),
+    ///     ),
     /// ];
     /// let sm = StateMachine::build(log)?;
     /// assert_eq!(*sm.current(), 2);
@@ -454,7 +481,7 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// Unlike [`Self::apply`], accepts a `Replace` whose target is undone at that point of the log,
     /// e.g. in a log merged from multiple sources. Such a `Replace` has no effect until its target
     /// is redone.
-    pub fn build(log: Vec<LogEntry<T>>) -> Result<Self, StateMachineError> {
+    pub fn build(log: Vec<LogEntry<T, M>>) -> Result<Self, StateMachineError> {
         let mut index_of = HashMap::with_capacity(log.len());
         for (index, entry) in log.iter().enumerate() {
             if index_of.insert(entry.id(), index).is_some() {
@@ -514,22 +541,26 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// sm.apply(LogEntry::new(
     ///     TransitionId::new(),
     ///     LogEntryKind::Apply(Box::new(Add(5))),
+    ///     (),
     /// ))?;
     /// assert_eq!(*sm.current(), 5);
     /// let add_7_transition_id = TransitionId::new();
     /// sm.apply(LogEntry::new(
     ///     add_7_transition_id,
     ///     LogEntryKind::Apply(Box::new(Add(7))),
+    ///     (),
     /// ))?;
     /// assert_eq!(*sm.current(), 12);
     /// sm.apply(LogEntry::new(
     ///     TransitionId::new(),
     ///     LogEntryKind::Apply(Box::new(Add(-3))),
+    ///     (),
     /// ))?;
     /// assert_eq!(*sm.current(), 9);
     /// sm.apply(LogEntry::new(
     ///     TransitionId::new(),
     ///     LogEntryKind::Undo(add_7_transition_id),
+    ///     (),
     /// ))?;
     /// assert_eq!(*sm.current(), 2);
     /// # Ok::<(), StateMachineError>(())
@@ -545,7 +576,7 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// `Apply`, and [`StateMachineError::ReplaceTargetNotInEffect`] if it targets an undone
     /// `Apply`. Returns [`StateMachineError::DuplicateId`] if `entry`'s id already appears in the
     /// log.
-    pub fn apply(&mut self, entry: LogEntry<T>) -> Result<(), StateMachineError> {
+    pub fn apply(&mut self, entry: LogEntry<T, M>) -> Result<(), StateMachineError> {
         if self.index_of.contains_key(&entry.id()) {
             return Err(StateMachineError::DuplicateId(entry.id()));
         }
@@ -574,8 +605,9 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
         }
     }
 
-    /// Applies `transition` as a new [`LogEntryKind::Apply`] with a fresh [`TransitionId`], see
-    /// [`Self::apply`], and returns that id, which a later `Undo` or `Replace` can target.
+    /// Applies `transition` as a new [`LogEntryKind::Apply`] with a fresh [`TransitionId`] and
+    /// `meta`, see [`Self::apply`], and returns that id, which a later `Undo` or `Replace` can
+    /// target.
     ///
     /// # Examples
     ///
@@ -598,13 +630,14 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// }
     ///
     /// let mut sm = StateMachine::<i64, Add>::new();
-    /// let add_5 = sm.apply_new(Add(5))?;
-    /// sm.apply_new(Add(3))?;
+    /// let add_5 = sm.apply_new(Add(5), ())?;
+    /// sm.apply_new(Add(3), ())?;
     /// assert_eq!(*sm.current(), 8);
     ///
     /// sm.apply(LogEntry::new(
     ///     TransitionId::new(),
     ///     LogEntryKind::Undo(add_5),
+    ///     (),
     /// ))?;
     /// assert_eq!(*sm.current(), 3);
     /// # Ok::<(), StateMachineError>(())
@@ -614,15 +647,15 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     ///
     /// Returns [`StateMachineError::Transition`] if `transition` is not applicable to
     /// [`Self::current`], in which case the log and [`Self::current`] are left unchanged.
-    pub fn apply_new(&mut self, transition: T) -> Result<TransitionId, StateMachineError> {
+    pub fn apply_new(&mut self, transition: T, meta: M) -> Result<TransitionId, StateMachineError> {
         let id = TransitionId::new();
-        self.apply(LogEntry::new(id, LogEntryKind::Apply(transition)))?;
+        self.apply(LogEntry::new(id, LogEntryKind::Apply(transition), meta))?;
         Ok(id)
     }
 
     /// Appends `entry`, an `Undo` or `Replace` whose target is checked already, and replays the log
     /// with it. On error, the log and [`Self::current`] are left unchanged.
-    fn push_and_replay(&mut self, entry: LogEntry<T>) -> Result<(), StateMachineError> {
+    fn push_and_replay(&mut self, entry: LogEntry<T, M>) -> Result<(), StateMachineError> {
         let id = entry.id();
         // the duplicate check in `apply` makes this insert always succeed
         self.index_of.insert(id, self.log.len());
@@ -651,7 +684,7 @@ impl<S: Default, T: Transition<S>> StateMachine<S, T> {
     /// Returns [`StateMachineError::Transition`] if any active transition's
     /// [`Transition::check_applicable`] fails. A failing replacement is reported with the id of
     /// its `Replace`.
-    fn replay(log: &[LogEntry<T>], effects: &[EntryEffect]) -> Result<S, StateMachineError> {
+    fn replay(log: &[LogEntry<T, M>], effects: &[EntryEffect]) -> Result<S, StateMachineError> {
         // transitions don't commute in general, they have to be applied in log order
         let active = (0..log.len()).filter_map(|index| transition_running_at(log, effects, index));
 

@@ -33,8 +33,8 @@ impl EntryEffect {
 /// Computes the effect of every entry of `log`, where `index_of` is the index of every id in it.
 ///
 /// Expects the target of every `Undo` and `Replace` to be an earlier entry (see [`check_target`]).
-pub(super) fn compute_effects<T>(
-    log: &[LogEntry<T>],
+pub(super) fn compute_effects<T, M>(
+    log: &[LogEntry<T, M>],
     index_of: &HashMap<TransitionId, usize>,
 ) -> Vec<EntryEffect> {
     // only a later entry can cancel or replace an entry, so by the time the backward walk reaches
@@ -71,7 +71,7 @@ pub(super) fn compute_effects<T>(
 }
 
 /// The transition of the [`LogEntryKind::Replace`] at the index `index` of `log`.
-fn replacing_transition<T>(log: &[LogEntry<T>], index: usize) -> &T {
+fn replacing_transition<T, M>(log: &[LogEntry<T, M>], index: usize) -> &T {
     match log[index].kind() {
         LogEntryKind::Replace { with, .. } => with,
         LogEntryKind::Apply(_) | LogEntryKind::Undo(_) => {
@@ -83,8 +83,8 @@ fn replacing_transition<T>(log: &[LogEntry<T>], index: usize) -> &T {
 /// The transition that runs at the index `index` of `log`, given the `effects` of its entries,
 /// with the id of the entry it comes from: the transition of an `Apply` in effect, or the one of
 /// its active replacement if it has one. `None` for any other entry.
-pub(super) fn transition_running_at<'a, T>(
-    log: &'a [LogEntry<T>],
+pub(super) fn transition_running_at<'a, T, M>(
+    log: &'a [LogEntry<T, M>],
     effects: &[EntryEffect],
     index: usize,
 ) -> Option<(TransitionId, &'a T)> {

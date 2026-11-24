@@ -36,6 +36,7 @@ pub fn apply_entry(value: i64) -> LogEntry<I64Transition> {
     LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Apply(Box::new(Add(value))),
+        (),
     )
 }
 
@@ -57,11 +58,15 @@ impl Transition<String> for Push {
 }
 
 pub fn push_entry(c: char) -> LogEntry<StringTransition> {
-    LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Push(c))))
+    LogEntry::new(
+        TransitionId::new(),
+        LogEntryKind::Apply(Box::new(Push(c))),
+        (),
+    )
 }
 
 pub fn undo_entry<T>(target: TransitionId) -> LogEntry<T> {
-    LogEntry::new(TransitionId::new(), LogEntryKind::Undo(target))
+    LogEntry::new(TransitionId::new(), LogEntryKind::Undo(target), ())
 }
 
 pub fn replace_push_entry(target: TransitionId, c: char) -> LogEntry<StringTransition> {
@@ -71,13 +76,14 @@ pub fn replace_push_entry(target: TransitionId, c: char) -> LogEntry<StringTrans
             target,
             with: Box::new(Push(c)),
         },
+        (),
     )
 }
 
 /// Applies `entry` to `sm` and returns its id.
-pub fn apply_get_id<S: Default, T: Transition<S>>(
-    sm: &mut StateMachine<S, T>,
-    entry: LogEntry<T>,
+pub fn apply_get_id<S: Default, T: Transition<S>, M>(
+    sm: &mut StateMachine<S, T, M>,
+    entry: LogEntry<T, M>,
 ) -> TransitionId {
     let id = entry.id();
     sm.apply(entry).unwrap();

@@ -24,25 +24,25 @@ fn a_session_undoes_and_redoes_its_actions_in_order() {
         push_in(&mut history, &mut sm, c);
     }
 
-    history.undo_last(&mut sm).unwrap();
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "a");
-    history.redo_last(&mut sm).unwrap();
+    history.redo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "ab");
-    history.undo_last(&mut sm).unwrap();
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "");
 
     assert!(matches!(
-        history.undo_last(&mut sm),
+        history.undo_last(&mut sm, ()),
         Err(UndoLastError::NothingToUndo)
     ));
     for expected in ["a", "ab", "abc"] {
-        history.redo_last(&mut sm).unwrap();
+        history.redo_last(&mut sm, ()).unwrap();
         assert_eq!(sm.current(), expected);
     }
     assert!(matches!(
-        history.redo_last(&mut sm),
+        history.redo_last(&mut sm, ()),
         Err(RedoLastError::NothingToRedo)
     ));
 }
@@ -51,10 +51,10 @@ fn a_session_undoes_and_redoes_its_actions_in_order() {
 fn apply_new_is_an_action_of_the_session() {
     let mut sm = StateMachine::<i64, I64Transition>::new();
     let mut history = SessionHistory::new();
-    let id = history.apply_new(&mut sm, Box::new(Add(5))).unwrap();
+    let id = history.apply_new(&mut sm, Box::new(Add(5)), ()).unwrap();
 
     assert_eq!(history.next_undo(&sm), Some(&[id][..]));
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
     assert_eq!(*sm.current(), 0);
 }
 
@@ -63,7 +63,7 @@ fn apply_new_that_is_rejected_changes_neither_the_log_nor_the_history() {
     let mut sm = StateMachine::<i64, I64Transition>::new();
     let mut history = SessionHistory::new();
 
-    let result = history.apply_new(&mut sm, Box::new(RequireAtLeast(1)));
+    let result = history.apply_new(&mut sm, Box::new(RequireAtLeast(1)), ());
 
     assert!(result.is_err());
     assert!(sm.log().is_empty());
@@ -75,12 +75,12 @@ fn a_new_action_leaves_nothing_to_redo() {
     let mut sm = StateMachine::<String, StringTransition>::new();
     let mut history = SessionHistory::new();
     push_in(&mut history, &mut sm, 'a');
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
 
     push_in(&mut history, &mut sm, 'b');
 
     assert!(matches!(
-        history.redo_last(&mut sm),
+        history.redo_last(&mut sm, ()),
         Err(RedoLastError::NothingToRedo)
     ));
     assert_eq!(sm.current(), "b");
@@ -93,11 +93,11 @@ fn a_session_undoes_its_own_actions_rather_than_those_of_another_session() {
     push_in(&mut history, &mut sm, 'a');
     sm.apply(push_entry('b')).unwrap();
 
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
 
     assert_eq!(sm.current(), "b");
     assert!(matches!(
-        history.undo_last(&mut sm),
+        history.undo_last(&mut sm, ()),
         Err(UndoLastError::NothingToUndo)
     ));
 }
@@ -113,15 +113,15 @@ fn undoing_a_targeted_undo_brings_back_what_it_undid() {
     history
         .apply(
             &mut sm,
-            LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a)),
+            LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a), ()),
         )
         .unwrap();
     assert_eq!(sm.current(), "b");
 
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
 
     assert_eq!(sm.current(), "ab");
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "a");
 }
 
@@ -134,7 +134,7 @@ fn undoing_a_replacement_brings_back_the_replaced_transition() {
     history.apply(&mut sm, replace_push_entry(a, 'x')).unwrap();
     assert_eq!(sm.current(), "xb");
 
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
 
     assert_eq!(sm.current(), "ab");
 }
@@ -149,7 +149,7 @@ fn an_action_another_session_undid_is_not_offered_until_it_is_back() {
     let b = push_in(&mut history, &mut sm, 'b');
     let elsewhere = apply_get_id(
         &mut sm,
-        LogEntry::new(TransitionId::new(), LogEntryKind::Undo(b)),
+        LogEntry::new(TransitionId::new(), LogEntryKind::Undo(b), ()),
     );
 
     assert_eq!(history.next_undo(&sm), None);
@@ -157,10 +157,11 @@ fn an_action_another_session_undid_is_not_offered_until_it_is_back() {
     sm.apply(LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Undo(elsewhere),
+        (),
     ))
     .unwrap();
     assert_eq!(history.next_undo(&sm), Some(&[b][..]));
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "a");
 }
 
@@ -171,24 +172,28 @@ fn undoing_an_action_another_session_undid_leaves_nothing_to_undo_but_keeps_what
     push_in(&mut history, &mut sm, 'a');
     let b = push_in(&mut history, &mut sm, 'b');
     let c = push_in(&mut history, &mut sm, 'c');
-    history.undo_last(&mut sm).unwrap();
-    sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Undo(b)))
-        .unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
+    sm.apply(LogEntry::new(
+        TransitionId::new(),
+        LogEntryKind::Undo(b),
+        (),
+    ))
+    .unwrap();
     let log_len = sm.log().len();
 
     assert!(matches!(
-        history.undo_last(&mut sm),
+        history.undo_last(&mut sm, ()),
         Err(UndoLastError::UndoneElsewhere)
     ));
 
     assert_eq!(sm.log().len(), log_len);
     assert_eq!(sm.current(), "a");
     assert!(matches!(
-        history.undo_last(&mut sm),
+        history.undo_last(&mut sm, ()),
         Err(UndoLastError::NothingToUndo)
     ));
     assert_eq!(history.next_redo(&sm), Some(&[c][..]));
-    history.redo_last(&mut sm).unwrap();
+    history.redo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "ac");
 }
 
@@ -199,28 +204,32 @@ fn redoing_an_action_another_session_redid_leaves_nothing_to_redo_but_keeps_what
     let a = push_in(&mut history, &mut sm, 'a');
     push_in(&mut history, &mut sm, 'b');
     push_in(&mut history, &mut sm, 'c');
-    history.undo_last(&mut sm).unwrap();
-    let [undo] = history.undo_last(&mut sm).unwrap()[..] else {
+    history.undo_last(&mut sm, ()).unwrap();
+    let [undo] = history.undo_last(&mut sm, ()).unwrap()[..] else {
         unreachable!("an action of one entry has one undo")
     };
-    sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo)))
-        .unwrap();
+    sm.apply(LogEntry::new(
+        TransitionId::new(),
+        LogEntryKind::Undo(undo),
+        (),
+    ))
+    .unwrap();
     let log_len = sm.log().len();
     assert_eq!(history.next_redo(&sm), None);
 
     assert!(matches!(
-        history.redo_last(&mut sm),
+        history.redo_last(&mut sm, ()),
         Err(RedoLastError::RedoneElsewhere)
     ));
 
     assert_eq!(sm.log().len(), log_len);
     assert_eq!(sm.current(), "ab");
     assert!(matches!(
-        history.redo_last(&mut sm),
+        history.redo_last(&mut sm, ()),
         Err(RedoLastError::NothingToRedo)
     ));
     assert_eq!(history.next_undo(&sm), Some(&[a][..]));
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "b");
 }
 
@@ -230,12 +239,12 @@ fn an_entry_of_another_session_leaves_what_to_redo() {
     let mut sm = StateMachine::<String, StringTransition>::new();
     let mut history = SessionHistory::new();
     let a = push_in(&mut history, &mut sm, 'a');
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
 
     sm.apply(push_entry('b')).unwrap();
 
     assert_eq!(history.next_redo(&sm), Some(&[a][..]));
-    history.redo_last(&mut sm).unwrap();
+    history.redo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "ab");
 }
 
@@ -249,18 +258,18 @@ fn an_action_the_session_undid_itself_is_undone_after_that_undo() {
     history
         .apply(
             &mut sm,
-            LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a)),
+            LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a), ()),
         )
         .unwrap();
     assert_eq!(sm.current(), "");
 
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "a");
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
 
     assert_eq!(sm.current(), "");
     assert!(matches!(
-        history.undo_last(&mut sm),
+        history.undo_last(&mut sm, ()),
         Err(UndoLastError::NothingToUndo)
     ));
 }
@@ -273,17 +282,18 @@ fn an_undo_an_entry_of_another_session_depends_on_is_rejected_and_leaves_nothing
     sm.apply(LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Apply(Box::new(RequireAtLeast(5))),
+        (),
     ))
     .unwrap();
     let log_len = sm.log().len();
 
-    let result = history.undo_last(&mut sm);
+    let result = history.undo_last(&mut sm, ());
 
     assert!(matches!(result, Err(UndoLastError::Rejected(_))));
     assert_eq!(sm.log().len(), log_len);
     assert_eq!(*sm.current(), 5);
     assert!(matches!(
-        history.undo_last(&mut sm),
+        history.undo_last(&mut sm, ()),
         Err(UndoLastError::NothingToUndo)
     ));
 }
@@ -302,24 +312,26 @@ fn a_redo_that_no_longer_applies_is_rejected_and_leaves_nothing_to_redo() {
             LogEntry::new(
                 TransitionId::new(),
                 LogEntryKind::Apply(Box::new(RequireAtLeast(6))),
+                (),
             ),
         )
         .unwrap();
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
     sm.apply(LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Undo(elsewhere),
+        (),
     ))
     .unwrap();
     let log_len = sm.log().len();
 
-    let result = history.redo_last(&mut sm);
+    let result = history.redo_last(&mut sm, ());
 
     assert!(matches!(result, Err(RedoLastError::Rejected(_))));
     assert_eq!(sm.log().len(), log_len);
     assert_eq!(*sm.current(), 1);
     assert!(matches!(
-        history.redo_last(&mut sm),
+        history.redo_last(&mut sm, ()),
         Err(RedoLastError::NothingToRedo)
     ));
     assert_eq!(history.next_undo(&sm), Some(&[first_id][..]));
@@ -346,7 +358,7 @@ fn a_group_is_undone_and_redone_as_one_action() {
     assert_eq!(sm.current(), "abcd");
     assert_eq!(history.next_undo(&sm), Some(&group[..]));
 
-    let undos = history.undo_last(&mut sm).unwrap();
+    let undos = history.undo_last(&mut sm, ()).unwrap();
 
     assert_eq!(sm.current(), "a");
     assert_eq!(undos.len(), 3);
@@ -361,13 +373,13 @@ fn a_group_is_undone_and_redone_as_one_action() {
     assert_eq!(targets, group.iter().rev().copied().collect::<Vec<_>>());
     assert_eq!(history.next_redo(&sm), Some(&group[..]));
 
-    let redos = history.redo_last(&mut sm).unwrap();
+    let redos = history.redo_last(&mut sm, ()).unwrap();
 
     assert_eq!(sm.current(), "abcd");
     assert_eq!(redos.len(), 3);
     assert_eq!(history.next_undo(&sm), Some(&group[..]));
-    history.undo_last(&mut sm).unwrap();
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "");
 }
 
@@ -376,12 +388,12 @@ fn an_empty_group_is_no_action() {
     let mut sm = StateMachine::<String, StringTransition>::new();
     let mut history = SessionHistory::new();
     push_in(&mut history, &mut sm, 'a');
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
 
     history.apply_all(&mut sm, []).unwrap();
 
     assert_eq!(history.next_undo(&sm), None);
-    history.redo_last(&mut sm).unwrap();
+    history.redo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "a");
 }
 
@@ -389,17 +401,18 @@ fn an_empty_group_is_no_action() {
 fn a_group_rejected_in_the_middle_leaves_state_and_history_unchanged() {
     let mut sm = StateMachine::<i64, I64Transition>::new();
     let mut history = SessionHistory::new();
-    let first = history.apply_new(&mut sm, Box::new(Add(1))).unwrap();
-    history.undo_last(&mut sm).unwrap();
-    history.redo_last(&mut sm).unwrap();
-    let a = history.apply_new(&mut sm, Box::new(Add(2))).unwrap();
-    history.undo_last(&mut sm).unwrap();
+    let first = history.apply_new(&mut sm, Box::new(Add(1)), ()).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
+    history.redo_last(&mut sm, ()).unwrap();
+    let a = history.apply_new(&mut sm, Box::new(Add(2)), ()).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
     let entries: Vec<LogEntry<I64Transition>> = vec![
         apply_entry(10),
         apply_entry(20),
         LogEntry::new(
             TransitionId::new(),
             LogEntryKind::Apply(Box::new(RequireAtLeast(100))),
+            (),
         ),
         apply_entry(40),
     ];
@@ -412,7 +425,7 @@ fn a_group_rejected_in_the_middle_leaves_state_and_history_unchanged() {
     assert_eq!(sm.entry(last).map(LogEntry::id), None);
     assert_eq!(history.next_undo(&sm), Some(&[first][..]));
     assert_eq!(history.next_redo(&sm), Some(&[a][..]));
-    history.redo_last(&mut sm).unwrap();
+    history.redo_last(&mut sm, ()).unwrap();
     assert_eq!(*sm.current(), 3);
 }
 
@@ -423,7 +436,7 @@ fn another_session_undoing_one_entry_of_a_group_leaves_nothing_to_undo() {
     let group = push_all_in(&mut history, &mut sm, "abc");
     let elsewhere = apply_get_id(
         &mut sm,
-        LogEntry::new(TransitionId::new(), LogEntryKind::Undo(group[1])),
+        LogEntry::new(TransitionId::new(), LogEntryKind::Undo(group[1]), ()),
     );
     assert_eq!(sm.current(), "ac");
     assert_eq!(history.next_undo(&sm), None);
@@ -432,24 +445,26 @@ fn another_session_undoing_one_entry_of_a_group_leaves_nothing_to_undo() {
     sm.apply(LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Undo(elsewhere),
+        (),
     ))
     .unwrap();
     assert_eq!(history.next_undo(&sm), Some(&group[..]));
     sm.apply(LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Undo(group[1]),
+        (),
     ))
     .unwrap();
     let log_len = sm.log().len();
 
     assert!(matches!(
-        history.undo_last(&mut sm),
+        history.undo_last(&mut sm, ()),
         Err(UndoLastError::UndoneElsewhere)
     ));
     assert_eq!(sm.log().len(), log_len);
     assert_eq!(sm.current(), "ac");
     assert!(matches!(
-        history.undo_last(&mut sm),
+        history.undo_last(&mut sm, ()),
         Err(UndoLastError::NothingToUndo)
     ));
 }
@@ -459,21 +474,22 @@ fn another_session_redoing_one_entry_of_a_group_leaves_nothing_to_redo() {
     let mut sm = StateMachine::<String, StringTransition>::new();
     let mut history = SessionHistory::new();
     let group = push_all_in(&mut history, &mut sm, "abc");
-    let undos = history.undo_last(&mut sm).unwrap();
+    let undos = history.undo_last(&mut sm, ()).unwrap();
     sm.apply(LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Undo(undos[0]),
+        (),
     ))
     .unwrap();
     assert_eq!(sm.current(), "c");
     assert_eq!(history.next_redo(&sm), None);
 
     assert!(matches!(
-        history.redo_last(&mut sm),
+        history.redo_last(&mut sm, ()),
         Err(RedoLastError::RedoneElsewhere)
     ));
     assert!(matches!(
-        history.redo_last(&mut sm),
+        history.redo_last(&mut sm, ()),
         Err(RedoLastError::NothingToRedo)
     ));
     assert_eq!(sm.is_in_effect(group[0]), Some(false));
@@ -487,19 +503,19 @@ fn a_group_undoing_its_own_entry_is_undone_as_a_whole() {
     let mut history = SessionHistory::new();
     push_in(&mut history, &mut sm, 'x');
     let a = push_entry('a');
-    let undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a.id()));
+    let undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a.id()), ());
     history
         .apply_all(&mut sm, [a, push_entry('b'), undo_a])
         .unwrap();
     assert_eq!(sm.current(), "xb");
 
     assert!(history.next_undo(&sm).is_some());
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "x");
-    history.redo_last(&mut sm).unwrap();
+    history.redo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "xb");
-    history.undo_last(&mut sm).unwrap();
-    history.undo_last(&mut sm).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
+    history.undo_last(&mut sm, ()).unwrap();
     assert_eq!(sm.current(), "");
 }
 
@@ -515,16 +531,55 @@ fn an_undo_of_a_group_rejected_part_of_the_way_keeps_what_it_undid() {
     sm.apply(LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Apply(Box::new(RequireAtLeast(5))),
+        (),
     ))
     .unwrap();
 
-    let result = history.undo_last(&mut sm);
+    let result = history.undo_last(&mut sm, ());
 
     assert!(matches!(result, Err(UndoLastError::Rejected(_))));
     assert_eq!(*sm.current(), 5);
     assert_eq!(sm.is_in_effect(second), Some(false));
     assert!(matches!(
-        history.undo_last(&mut sm),
+        history.undo_last(&mut sm, ()),
         Err(UndoLastError::NothingToUndo)
     ));
+}
+
+#[test]
+fn the_entries_appended_by_an_undo_and_a_redo_carry_the_meta_given_to_them() {
+    let mut sm = StateMachine::<i64, I64Transition, &str>::new();
+    let mut history = SessionHistory::new();
+    history
+        .apply_new(&mut sm, Box::new(Add(1)), "applied")
+        .unwrap();
+
+    let undos = history.undo_last(&mut sm, "undone").unwrap();
+    let redos = history.redo_last(&mut sm, "redone").unwrap();
+
+    assert_eq!(sm.entry(undos[0]).map(LogEntry::meta), Some(&"undone"));
+    assert_eq!(sm.entry(redos[0]).map(LogEntry::meta), Some(&"redone"));
+}
+
+#[test]
+fn the_undos_of_a_rejected_group_carry_the_meta_of_the_rejected_entry() {
+    let mut sm = StateMachine::<i64, I64Transition, &str>::new();
+    let mut history = SessionHistory::new();
+    let entries: Vec<LogEntry<I64Transition, &str>> = vec![
+        LogEntry::new(
+            TransitionId::new(),
+            LogEntryKind::Apply(Box::new(Add(1))),
+            "first",
+        ),
+        LogEntry::new(
+            TransitionId::new(),
+            LogEntryKind::Apply(Box::new(RequireAtLeast(100))),
+            "rejected",
+        ),
+    ];
+
+    history.apply_all(&mut sm, entries).unwrap_err();
+
+    let metas: Vec<_> = sm.log().iter().map(LogEntry::meta).collect();
+    assert_eq!(metas, [&"first", &"rejected"]);
 }

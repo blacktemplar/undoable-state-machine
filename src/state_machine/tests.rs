@@ -31,8 +31,12 @@ fn undo_keeps_the_surviving_transitions_in_log_order() {
     sm.apply(push_entry('b')).unwrap();
     assert_eq!(sm.current(), "axb");
 
-    sm.apply(LogEntry::new(TransitionId::new(), LogEntryKind::Undo(x_id)))
-        .unwrap();
+    sm.apply(LogEntry::new(
+        TransitionId::new(),
+        LogEntryKind::Undo(x_id),
+        (),
+    ))
+    .unwrap();
 
     assert_eq!(sm.current(), "ab");
 }
@@ -43,9 +47,9 @@ fn build_reactivates_an_undone_entry_in_its_original_slot() {
     let x = push_entry('x');
     let x_id = x.id();
     let b = push_entry('b');
-    let undo_x = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(x_id));
+    let undo_x = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(x_id), ());
     let undo_x_id = undo_x.id();
-    let undo_undo_x = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo_x_id));
+    let undo_undo_x = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo_x_id), ());
 
     let undone = StateMachine::build(vec![a, x, b, undo_x]).unwrap();
     assert_eq!(undone.current(), "ab");
@@ -54,9 +58,10 @@ fn build_reactivates_an_undone_entry_in_its_original_slot() {
     let x = LogEntry::new(
         x_id,
         LogEntryKind::Apply(Box::new(Push('x')) as StringTransition),
+        (),
     );
     let b = push_entry('b');
-    let undo_x = LogEntry::new(undo_x_id, LogEntryKind::Undo(x_id));
+    let undo_x = LogEntry::new(undo_x_id, LogEntryKind::Undo(x_id), ());
     let redone = StateMachine::build(vec![a, x, b, undo_x, undo_undo_x]).unwrap();
 
     // `x` is active again, back in its original position - not appended at the end.
@@ -79,6 +84,7 @@ fn append_rejects_a_not_applicable_transition_without_mutating_state() {
     let entry: LogEntry<I64Transition> = LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Apply(Box::new(RequireAtLeast(10))),
+        (),
     );
     let failing_id = entry.id();
     let err = sm.apply(entry).unwrap_err();
@@ -94,8 +100,11 @@ fn append_rejects_a_not_applicable_transition_without_mutating_state() {
 #[test]
 fn undo_cancels_a_prior_apply() {
     let mut sm = StateMachine::<i64, I64Transition>::default();
-    let first: LogEntry<I64Transition> =
-        LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(5))));
+    let first: LogEntry<I64Transition> = LogEntry::new(
+        TransitionId::new(),
+        LogEntryKind::Apply(Box::new(Add(5))),
+        (),
+    );
     let first_id = first.id();
     sm.apply(first).unwrap();
     sm.apply(apply_entry(3)).unwrap();
@@ -104,6 +113,7 @@ fn undo_cancels_a_prior_apply() {
     sm.apply(LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Undo(first_id),
+        (),
     ))
     .unwrap();
 
@@ -119,6 +129,7 @@ fn undo_of_unknown_target_is_rejected() {
         .apply(LogEntry::new(
             TransitionId::new(),
             LogEntryKind::Undo(TransitionId::new()),
+            (),
         ))
         .unwrap_err();
 
@@ -131,8 +142,11 @@ fn undo_of_unknown_target_is_rejected() {
 fn undo_that_breaks_a_later_entry_is_rejected_and_blames_that_entry() {
     let mut sm = StateMachine::<i64, I64Transition>::default();
 
-    let add: LogEntry<I64Transition> =
-        LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Box::new(Add(10))));
+    let add: LogEntry<I64Transition> = LogEntry::new(
+        TransitionId::new(),
+        LogEntryKind::Apply(Box::new(Add(10))),
+        (),
+    );
     let add_id = add.id();
     sm.apply(add).unwrap();
 
@@ -140,13 +154,14 @@ fn undo_that_breaks_a_later_entry_is_rejected_and_blames_that_entry() {
     let guard: LogEntry<I64Transition> = LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Apply(Box::new(RequireAtLeast(10))),
+        (),
     );
     let guard_id = guard.id();
     sm.apply(guard).unwrap();
 
     let undo_id = TransitionId::new();
     let err = sm
-        .apply(LogEntry::new(undo_id, LogEntryKind::Undo(add_id)))
+        .apply(LogEntry::new(undo_id, LogEntryKind::Undo(add_id), ()))
         .unwrap_err();
 
     match err {
@@ -166,7 +181,7 @@ fn apply_rejects_a_duplicate_id() {
     let id = entry.id();
     sm.apply(entry).unwrap();
 
-    let dup: LogEntry<I64Transition> = LogEntry::new(id, LogEntryKind::Apply(Box::new(Add(3))));
+    let dup: LogEntry<I64Transition> = LogEntry::new(id, LogEntryKind::Apply(Box::new(Add(3))), ());
     let err = sm.apply(dup).unwrap_err();
 
     match err {
@@ -184,7 +199,7 @@ fn apply_rejects_an_undo_with_a_duplicate_id() {
     let id = entry.id();
     sm.apply(entry).unwrap();
 
-    let dup: LogEntry<I64Transition> = LogEntry::new(id, LogEntryKind::Undo(id));
+    let dup: LogEntry<I64Transition> = LogEntry::new(id, LogEntryKind::Undo(id), ());
     let err = sm.apply(dup).unwrap_err();
 
     match err {
@@ -199,7 +214,7 @@ fn apply_rejects_an_undo_with_a_duplicate_id() {
 fn build_rejects_a_duplicate_id() {
     let a = apply_entry(5);
     let id = a.id();
-    let b: LogEntry<I64Transition> = LogEntry::new(id, LogEntryKind::Apply(Box::new(Add(3))));
+    let b: LogEntry<I64Transition> = LogEntry::new(id, LogEntryKind::Apply(Box::new(Add(3))), ());
 
     match StateMachine::<i64, I64Transition>::build(vec![a, b]) {
         Err(StateMachineError::DuplicateId(dup_id)) => assert_eq!(dup_id, id),
@@ -213,7 +228,7 @@ fn build_computes_current_from_a_log() {
     let a = apply_entry(5);
     let a_id = a.id();
     let b = apply_entry(3);
-    let undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a_id));
+    let undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a_id), ());
 
     let sm = StateMachine::build(vec![a, b, undo_a]).unwrap();
 
@@ -224,10 +239,10 @@ fn build_computes_current_from_a_log() {
 #[test]
 fn build_with_undone_undo_computes_current() {
     let a_id = TransitionId::new();
-    let a = LogEntry::new(a_id, LogEntryKind::Apply(Box::new(Add(5))));
+    let a = LogEntry::new(a_id, LogEntryKind::Apply(Box::new(Add(5))), ());
     let undo_a_id = TransitionId::new();
-    let undo_a = LogEntry::new(undo_a_id, LogEntryKind::Undo(a_id));
-    let undo_undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo_a_id));
+    let undo_a = LogEntry::new(undo_a_id, LogEntryKind::Undo(a_id), ());
+    let undo_undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo_a_id), ());
 
     let sm = StateMachine::build(vec![a, undo_a, undo_undo_a]).unwrap();
 
@@ -240,6 +255,7 @@ fn build_surfaces_the_failing_transition() {
     let entry: LogEntry<I64Transition> = LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Apply(Box::new(RequireAtLeast(100))),
+        (),
     );
     let failing_id = entry.id();
 
@@ -256,7 +272,7 @@ fn build_surfaces_the_failing_transition() {
 #[test]
 fn build_rejects_undo_of_an_unknown_target() {
     let unknown_id = TransitionId::new();
-    let undo = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(unknown_id));
+    let undo = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(unknown_id), ());
 
     match StateMachine::<i64, I64Transition>::build(vec![undo]) {
         Err(StateMachineError::UnknownTarget(id)) => assert_eq!(id, unknown_id),
@@ -282,7 +298,7 @@ fn build_rejects_an_undone_undo_of_an_unknown_target() {
 fn build_rejects_undo_appearing_before_its_target() {
     let a = apply_entry(5);
     let a_id = a.id();
-    let undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a_id));
+    let undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a_id), ());
 
     match StateMachine::<i64, I64Transition>::build(vec![undo_a, a]) {
         Err(StateMachineError::UnknownTarget(id)) => assert_eq!(id, a_id),
@@ -295,9 +311,9 @@ fn build_rejects_undo_appearing_before_its_target() {
 fn build_allows_undoing_an_undo_to_reactivate_the_original() {
     let a = apply_entry(5);
     let a_id = a.id();
-    let undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a_id));
+    let undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a_id), ());
     let undo_a_id = undo_a.id();
-    let undo_undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo_a_id));
+    let undo_undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo_a_id), ());
 
     let sm = StateMachine::build(vec![a, undo_a, undo_undo_a]).unwrap();
 
@@ -308,9 +324,9 @@ fn build_allows_undoing_an_undo_to_reactivate_the_original() {
 fn rev_in_effect_skips_an_undone_undo_but_not_its_target() {
     let a = apply_entry(5);
     let a_id = a.id();
-    let undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a_id));
+    let undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a_id), ());
     let undo_a_id = undo_a.id();
-    let undo_undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo_a_id));
+    let undo_undo_a = LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo_a_id), ());
     let undo_undo_a_id = undo_undo_a.id();
 
     let sm = StateMachine::build(vec![a, undo_a, undo_undo_a]).unwrap();
@@ -385,6 +401,7 @@ fn replace_can_satisfy_a_later_entry_that_undoing_its_target_would_break() {
     sm.apply(LogEntry::new(
         TransitionId::new(),
         LogEntryKind::Apply(Box::new(RequireAtLeast(10))),
+        (),
     ))
     .unwrap();
 
@@ -394,6 +411,7 @@ fn replace_can_satisfy_a_later_entry_that_undoing_its_target_would_break() {
             target: add_id,
             with: Box::new(Add(20)),
         },
+        (),
     ))
     .unwrap();
 
@@ -409,6 +427,7 @@ fn replace_that_breaks_a_later_entry_is_rejected_and_blames_that_entry() {
         LogEntry::new(
             TransitionId::new(),
             LogEntryKind::Apply(Box::new(RequireAtLeast(10))),
+            (),
         ),
     );
 
@@ -420,6 +439,7 @@ fn replace_that_breaks_a_later_entry_is_rejected_and_blames_that_entry() {
                 target: add_id,
                 with: Box::new(Add(1)),
             },
+            (),
         ))
         .unwrap_err();
 
@@ -445,6 +465,7 @@ fn a_failing_replacement_is_rejected_and_blames_the_replace() {
                 target: add_id,
                 with: Box::new(RequireAtLeast(1)),
             },
+            (),
         ))
         .unwrap_err();
 
@@ -609,7 +630,7 @@ fn rev_in_effect_applied_skips_undone_applies_and_keeps_redone_ones() {
 #[test]
 fn apply_new_applies_the_transition_as_an_apply_with_the_id_it_returns() {
     let mut sm = StateMachine::<i64, I64Transition>::default();
-    let id = sm.apply_new(Box::new(Add(5))).unwrap();
+    let id = sm.apply_new(Box::new(Add(5)), ()).unwrap();
 
     assert_eq!(*sm.current(), 5);
     assert!(matches!(
@@ -622,7 +643,7 @@ fn apply_new_applies_the_transition_as_an_apply_with_the_id_it_returns() {
 fn apply_new_rejects_a_not_applicable_transition_without_changing_the_log() {
     let mut sm = StateMachine::<i64, I64Transition>::default();
 
-    let result = sm.apply_new(Box::new(RequireAtLeast(1)));
+    let result = sm.apply_new(Box::new(RequireAtLeast(1)), ());
 
     assert!(matches!(result, Err(StateMachineError::Transition(..))));
     assert!(sm.log().is_empty());
@@ -696,7 +717,7 @@ proptest::proptest! {
                 }
             };
 
-            if sm.apply(LogEntry::new(id, kind)).is_ok() {
+            if sm.apply(LogEntry::new(id, kind, ())).is_ok() {
                 mirror.push((id, mirror_kind));
                 all_ids.push(id);
             }
@@ -718,7 +739,7 @@ proptest::proptest! {
                             with: Box::new(Add(*v)) as I64Transition,
                         },
                     };
-                    LogEntry::new(*id, kind)
+                    LogEntry::new(*id, kind, ())
                 })
                 .collect();
             let rebuilt = StateMachine::<i64, I64Transition>::build(rebuilt_log).unwrap();
@@ -775,7 +796,7 @@ proptest::proptest! {
                         target: *target,
                         with: Box::new(Push(*c)) as StringTransition,
                     },
-                });
+                }, ());
 
             // `Push` is applicable to any state and never fails, so only
             // a replace of an entry that isn't an active push can be
@@ -944,11 +965,11 @@ fn whether_an_entry_is_in_effect_depends_on_the_undos_in_effect_after_it() {
     let a = apply_get_id(&mut sm, push_entry('a'));
     let undo = apply_get_id(
         &mut sm,
-        LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a)),
+        LogEntry::new(TransitionId::new(), LogEntryKind::Undo(a), ()),
     );
     let redo = apply_get_id(
         &mut sm,
-        LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo)),
+        LogEntry::new(TransitionId::new(), LogEntryKind::Undo(undo), ()),
     );
 
     assert_eq!(sm.is_in_effect(a), Some(true));
@@ -988,8 +1009,8 @@ mod serde_support {
 
     #[test]
     fn a_log_round_trips_through_json() {
-        let add = LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Arith::Add(5)));
-        let mul = LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Arith::Mul(3)));
+        let add = LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Arith::Add(5)), ());
+        let mul = LogEntry::new(TransitionId::new(), LogEntryKind::Apply(Arith::Mul(3)), ());
         let log = vec![add, mul];
 
         let json = serde_json::to_string(&log).unwrap();
@@ -1003,21 +1024,34 @@ mod serde_support {
     }
 
     #[test]
+    fn the_meta_of_an_entry_round_trips_through_json() {
+        let mut sm = StateMachine::<i64, Arith, u64>::new();
+        sm.apply_new(Arith::Add(5), 1_764_000_000_000).unwrap();
+
+        let json = serde_json::to_string(&sm).unwrap();
+        let restored: StateMachine<i64, Arith, u64> = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(*restored.log()[0].meta(), 1_764_000_000_000);
+    }
+
+    #[test]
     fn a_state_machine_round_trips_through_json_with_its_undos() {
         let mut sm = StateMachine::<i64, Arith>::new();
         sm.apply(LogEntry::new(
             TransitionId::new(),
             LogEntryKind::Apply(Arith::Add(5)),
+            (),
         ))
         .unwrap();
         let doubling_id = TransitionId::new();
         sm.apply(LogEntry::new(
             doubling_id,
             LogEntryKind::Apply(Arith::Mul(2)),
+            (),
         ))
         .unwrap();
         let undo_id = TransitionId::new();
-        sm.apply(LogEntry::new(undo_id, LogEntryKind::Undo(doubling_id)))
+        sm.apply(LogEntry::new(undo_id, LogEntryKind::Undo(doubling_id), ()))
             .unwrap();
         assert_eq!(*sm.current(), 5);
 
@@ -1033,6 +1067,7 @@ mod serde_support {
             .apply(LogEntry::new(
                 TransitionId::new(),
                 LogEntryKind::Undo(undo_id),
+                (),
             ))
             .unwrap();
         assert_eq!(*restored.current(), 10);
@@ -1044,6 +1079,7 @@ mod serde_support {
         let log: Vec<LogEntry<Arith>> = vec![LogEntry::new(
             TransitionId::new(),
             LogEntryKind::Undo(unknown_id),
+            (),
         )];
         let json = serde_json::to_string(&log).unwrap();
 

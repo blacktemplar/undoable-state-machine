@@ -43,14 +43,16 @@ use crate::{LogEntry, StateMachine, Transition};
 /// sm.apply(LogEntry::new(
 ///     TransitionId::new(),
 ///     LogEntryKind::Apply(Arith::Add(5)),
+///     (),
 /// ))?;
 /// let doubling_id = TransitionId::new();
 /// sm.apply(LogEntry::new(
 ///     doubling_id,
 ///     LogEntryKind::Apply(Arith::Mul(2)),
+///     (),
 /// ))?;
 /// let undo_id = TransitionId::new();
-/// sm.apply(LogEntry::new(undo_id, LogEntryKind::Undo(doubling_id)))?;
+/// sm.apply(LogEntry::new(undo_id, LogEntryKind::Undo(doubling_id), ()))?;
 /// assert_eq!(*sm.current(), 5);
 ///
 /// let json = serde_json::to_string(&sm)?;
@@ -61,12 +63,13 @@ use crate::{LogEntry, StateMachine, Transition};
 /// restored.apply(LogEntry::new(
 ///     TransitionId::new(),
 ///     LogEntryKind::Undo(undo_id),
+///     (),
 /// ))?;
 /// assert_eq!(*restored.current(), 10);
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[cfg(feature = "serde")]
-impl<S, T: Serialize> Serialize for StateMachine<S, T> {
+impl<S, T: Serialize, M: Serialize> Serialize for StateMachine<S, T, M> {
     fn serialize<Ser: Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
         self.log.serialize(serializer)
     }
@@ -79,9 +82,11 @@ impl<S, T: Serialize> Serialize for StateMachine<S, T> {
 /// `build` would reject: a duplicate entry id, an undo of an unknown target, or an active
 /// transition that doesn't replay cleanly.
 #[cfg(feature = "serde")]
-impl<'de, S: Default, T: Transition<S> + Deserialize<'de>> Deserialize<'de> for StateMachine<S, T> {
+impl<'de, S: Default, T: Transition<S> + Deserialize<'de>, M: Deserialize<'de>> Deserialize<'de>
+    for StateMachine<S, T, M>
+{
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let log = Vec::<LogEntry<T>>::deserialize(deserializer)?;
+        let log = Vec::<LogEntry<T, M>>::deserialize(deserializer)?;
         Self::build(log).map_err(serde::de::Error::custom)
     }
 }

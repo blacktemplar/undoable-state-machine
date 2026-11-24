@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-24
+
+### Added
+
+- Metadata on every log entry: `LogEntry<T, M = ()>` holds a `meta: M` (`LogEntry::meta`), and
+  `StateMachine<S, T, M = ()>` keeps entries of that type. The state machine never reads it and
+  never makes it up, e.g. a consumer records when an entry was appended.
+
+### Changed
+
+- **Breaking:** every operation appending an entry takes its metadata: `LogEntry::new(id, kind,
+  meta)`, `StateMachine::apply_new(transition, meta)`, `SessionHistory::apply_new(machine,
+  transition, meta)`, and `SessionHistory::undo_last(machine, meta)` and `redo_last(machine,
+  meta)` for each undo entry they append (so `M: Clone`). The undos `SessionHistory::apply_all`
+  appends after a rejected entry carry that entry's metadata. Pass `()` to record nothing.
+- **Breaking:** with the `serde` feature, an entry serializes as `{"id", "kind", "meta"}`. A log
+  serialized by an earlier version has no `meta` and has to be converted before it is read.
+
 ## [0.4.0] - 2026-11-16
 
 ### Added

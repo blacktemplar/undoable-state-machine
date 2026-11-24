@@ -40,34 +40,41 @@ impl TransitionId {
 
 /// One entry in a [`StateMachine`]'s append-only log.
 ///
-/// With the `serde` feature, an entry is (de)serializable whenever the transition type `T` is, so
+/// Besides its id and kind, an entry carries `meta`, whatever the consumer records about it (e.g.
+/// when it was appended). The state machine never looks at it: it neither affects replaying nor
+/// is it made up by the state machine, since every operation appending an entry takes the `meta`
+/// of it. `()` records nothing.
+///
+/// With the `serde` feature, an entry is (de)serializable whenever `T` and `M` are, so
 /// a whole log (`Vec<LogEntry<T>>`), including its undo entries, can be persisted. Note that
 /// `Box<dyn Transition<S>>` is not (de)serializable - use an enum of the transitions, or a crate
 /// like [`typetag`](https://docs.rs/typetag), as `T` if you need to persist a log.
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct LogEntry<T> {
+pub struct LogEntry<T, M = ()> {
     id: TransitionId,
     kind: LogEntryKind<T>,
+    meta: M,
 }
 
-impl<T> LogEntry<T> {
-    /// Creates a new log entry with the given id and kind.
+impl<T, M> LogEntry<T, M> {
+    /// Creates a new log entry with the given id, kind and meta.
     ///
     /// # Examples
     ///
     /// ```
     /// use undoable_state_machine::{LogEntry, LogEntryKind, TransitionId};
     ///
-    /// let entry = LogEntry::new(TransitionId::new(), LogEntryKind::Apply(5));
+    /// let entry = LogEntry::new(TransitionId::new(), LogEntryKind::Apply(5), "meta");
     /// match entry.kind() {
     ///     LogEntryKind::Apply(v) => assert_eq!(*v, 5),
     ///     LogEntryKind::Undo(_) | LogEntryKind::Replace { .. } => unreachable!(),
     /// }
+    /// assert_eq!(*entry.meta(), "meta");
     /// ```
     #[must_use]
-    pub fn new(id: TransitionId, kind: LogEntryKind<T>) -> Self {
-        Self { id, kind }
+    pub fn new(id: TransitionId, kind: LogEntryKind<T>, meta: M) -> Self {
+        Self { id, kind, meta }
     }
 
     /// Uniquely identifies this entry so a later entry can target it via [`LogEntryKind::Undo`] or
@@ -80,6 +87,11 @@ impl<T> LogEntry<T> {
     /// transition.
     pub fn kind(&self) -> &LogEntryKind<T> {
         &self.kind
+    }
+
+    /// What the consumer recorded about this entry.
+    pub fn meta(&self) -> &M {
+        &self.meta
     }
 }
 
